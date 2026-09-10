@@ -4,8 +4,10 @@ import android.annotation.SuppressLint
 import android.app.Application
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.compose.BackHandler
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -16,7 +18,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.BookmarkBorder
 import androidx.compose.material.icons.outlined.Download
+import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Search
@@ -38,7 +42,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -71,8 +77,10 @@ import com.calmcast.podcast.ui.PodcastViewModel
 import com.calmcast.podcast.ui.PodcastViewModelFactory
 import com.calmcast.podcast.ui.SettingsScreen
 import com.calmcast.podcast.ui.downloads.DownloadsScreen
+import com.calmcast.podcast.ui.history.HistoryScreen
 import com.calmcast.podcast.ui.podcastdetail.FeedNotFoundScreen
 import com.calmcast.podcast.ui.podcastdetail.PodcastDetailScreen
+import com.calmcast.podcast.ui.queue.QueueScreen
 import com.calmcast.podcast.ui.search.SearchScreen
 import com.calmcast.podcast.ui.subscriptions.SubscriptionsScreen
 import com.calmcast.podcast.ui.subscriptions.AddRSSFeedModal
@@ -81,6 +89,7 @@ import com.mudita.mmd.components.buttons.ButtonMMD
 import com.mudita.mmd.components.divider.HorizontalDividerMMD
 import com.mudita.mmd.components.nav_bar.NavigationBarItemMMD
 import com.mudita.mmd.components.nav_bar.NavigationBarMMD
+import com.calmcast.podcast.ui.common.ContinueListeningStrip
 import com.mudita.mmd.components.progress_indicator.CircularProgressIndicatorMMD
 import com.mudita.mmd.components.search_bar.SearchBarDefaultsMMD
 import com.mudita.mmd.components.snackbar.SnackbarHostMMD
@@ -91,12 +100,16 @@ import kotlinx.coroutines.launch
 
 sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
     object Subscriptions : Screen("subscriptions", "Following", Icons.Outlined.StarBorder)
+    object Queue : Screen("queue", "Queue", Icons.Outlined.BookmarkBorder)
+    object History : Screen("history", "History", Icons.Outlined.History)
     object Downloads : Screen("downloads", "Downloads", Icons.Outlined.Download)
     object Settings : Screen("settings", "Settings", Icons.Outlined.Settings)
 }
 
 val navItems = listOf(
     Screen.Subscriptions,
+    Screen.Queue,
+    Screen.History,
     Screen.Downloads,
     Screen.Settings
 )
@@ -122,10 +135,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onResume() {
-        super.onResume()
-        refreshCallback?.invoke()
-    }
+    // NOTE: deliberately no onResume() refresh — AppLifecycleTracker already refreshes
+    // on ON_START (throttled). Having both meant two full feed refreshes per screen wake,
+    // which saturated the e-ink device's CPU and made the whole app laggy.
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
@@ -169,14 +181,18 @@ fun CalmCastApp(pipStateHolder: androidx.compose.runtime.MutableState<Boolean>, 
     val podcastDao = database.podcastDao()
     val playbackPositionDao = database.playbackPositionDao()
     val downloadDao = database.downloadDao()
-    val viewModel: PodcastViewModel = viewModel(factory = PodcastViewModelFactory(application, podcastDao, playbackPositionDao, downloadDao, settingsManager))
+    val listenHistoryDao = database.listenHistoryDao()
+    val savedEpisodeDao = database.savedEpisodeDao()
+    val viewModel: PodcastViewModel = viewModel(factory = PodcastViewModelFactory(application, podcastDao, playbackPositionDao, downloadDao, listenHistoryDao, savedEpisodeDao, settingsManager))
 
-    LaunchedEffect(Unit) {
-        val callback: (() -> Unit)? = {
+    DisposableEffect(Unit) {
+        val callback: (() -> Unit) = {
             viewModel.reloadData()
         }
         AppLifecycleTracker.setRefreshCallback(callback)
         onRefreshCallbackReady?.invoke(callback)
+        // Clear the static reference so the ViewModel/Activity can be GC'd
+        onDispose { AppLifecycleTracker.setRefreshCallback(null) }
     }
 
     LaunchedEffect(Unit) {
@@ -489,15 +505,20 @@ fun CalmCastApp(pipStateHolder: androidx.compose.runtime.MutableState<Boolean>, 
                         popEnterTransition = { EnterTransition.None },
                         popExitTransition = { ExitTransition.None }
                     ) {
-                        SubscriptionsScreen(
-                            podcasts = viewModel.subscriptions.value,
-                            onPodcastClick = { podcast ->
-                                viewModel.clearPodcastDetails()
-                                navController.navigate("detail/${podcast.id}")
-                            },
-                            removeDividers = viewModel.removeHorizontalDividers.value,
-                            isLoading = viewModel.isLoading.value,
-                        )
+                        Column(modifier = Modifier.fillMaxSize()) {
+                            ContinueListeningStrip(viewModel)
+                            Box(modifier = Modifier.weight(1f)) {
+                                SubscriptionsScreen(
+                                    podcasts = viewModel.subscriptions.value,
+                                    onPodcastClick = { podcast ->
+                                        viewModel.clearPodcastDetails()
+                                        navController.navigate("detail/${podcast.id}")
+                                    },
+                                    removeDividers = viewModel.removeHorizontalDividers.value,
+                                    isLoading = viewModel.isLoading.value,
+                                )
+                            }
+                        }
                     }
                     composable(
                         "search",
@@ -527,7 +548,8 @@ fun CalmCastApp(pipStateHolder: androidx.compose.runtime.MutableState<Boolean>, 
                                     }
                                 }
                             },
-                            removeDividers = viewModel.removeHorizontalDividers.value
+                            removeDividers = viewModel.removeHorizontalDividers.value,
+                            isLoading = viewModel.isLoading.value
                         )
                     }
                     composable(
@@ -553,7 +575,18 @@ fun CalmCastApp(pipStateHolder: androidx.compose.runtime.MutableState<Boolean>, 
                                 onBackClick = { navController.navigateUp() }
                             )
                         } else {
-                            val podcastWithEpisodes = viewModel.currentPodcastDetails.value ?: return@composable
+                            val podcastWithEpisodes = viewModel.currentPodcastDetails.value
+                            // Never render stale data from a previously viewed podcast —
+                            // show a loader until the loaded details match this route.
+                            if (podcastWithEpisodes == null || podcastWithEpisodes.podcast.id != podcastId) {
+                                Box(
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    CircularProgressIndicatorMMD()
+                                }
+                                return@composable
+                            }
 
                             val podcast = podcastWithEpisodes.podcast
                             val episodes = podcastWithEpisodes.episodes
@@ -590,9 +623,69 @@ fun CalmCastApp(pipStateHolder: androidx.compose.runtime.MutableState<Boolean>, 
                                 onRefreshClick = {
                                     viewModel.refreshPodcastEpisodes(podcast.id)
                                 },
-                                removeDividers = viewModel.removeHorizontalDividers.value
+                                onSaveClick = { episode: Episode ->
+                                    viewModel.toggleSaveEpisode(episode)
+                                },
+                                isSaved = { episodeId ->
+                                    viewModel.isEpisodeSaved(episodeId)
+                                },
+                                onMarkPlayedClick = { episode: Episode ->
+                                    viewModel.markAsPlayed(episode)
+                                },
+                                onMarkUnplayedClick = { episode: Episode ->
+                                    viewModel.markAsUnplayed(episode)
+                                },
+                                removeDividers = viewModel.removeHorizontalDividers.value,
+                                sortOrder = viewModel.episodeSortOrder.value,
+                                onSortOrderChange = { viewModel.setEpisodeSortOrder(it) },
+                                episodeFilter = viewModel.episodeFilter.value,
+                                onEpisodeFilterChange = { viewModel.setEpisodeFilter(it) }
                             )
                         }
+                    }
+                    composable(
+                        "queue",
+                        enterTransition = { EnterTransition.None },
+                        exitTransition = { ExitTransition.None },
+                        popEnterTransition = { EnterTransition.None },
+                        popExitTransition = { ExitTransition.None }
+                    ) {
+                        QueueScreen(
+                            savedEpisodes = viewModel.savedEpisodes.value,
+                            playbackPositions = viewModel.playbackPositions.value,
+                            currentPlayingEpisodeId = viewModel.currentEpisode.value?.id,
+                            onEpisodeClick = { episode ->
+                                viewModel.playEpisodeFromPodcast(episode)
+                            },
+                            onRemoveClick = { episodeId ->
+                                viewModel.removeSavedEpisode(episodeId)
+                            },
+                            toEpisode = viewModel::savedEpisodeToEpisode,
+                            removeDividers = viewModel.removeHorizontalDividers.value,
+                            onMoveUp = { episodeId -> viewModel.moveQueueItem(episodeId, up = true) },
+                            onMoveDown = { episodeId -> viewModel.moveQueueItem(episodeId, up = false) }
+                        )
+                    }
+                    composable(
+                        "history",
+                        enterTransition = { EnterTransition.None },
+                        exitTransition = { ExitTransition.None },
+                        popEnterTransition = { EnterTransition.None },
+                        popExitTransition = { ExitTransition.None }
+                    ) {
+                        HistoryScreen(
+                            history = viewModel.listenHistory.value,
+                            playbackPositions = viewModel.playbackPositions.value,
+                            currentPlayingEpisodeId = viewModel.currentEpisode.value?.id,
+                            onEpisodeClick = { episode ->
+                                viewModel.playEpisodeFromPodcast(episode)
+                            },
+                            onRemoveClick = { episodeId ->
+                                viewModel.removeFromHistory(episodeId)
+                            },
+                            toEpisode = viewModel::historyEntryToEpisode,
+                            removeDividers = viewModel.removeHorizontalDividers.value
+                        )
                     }
                     composable(
                         "downloads",
@@ -601,7 +694,10 @@ fun CalmCastApp(pipStateHolder: androidx.compose.runtime.MutableState<Boolean>, 
                         popEnterTransition = { EnterTransition.None },
                         popExitTransition = { ExitTransition.None }
                     ) {
-                        val downloads = viewModel.downloads.value.sortedByDescending { it.episode.publishDateMillis }
+                        val rawDownloads = viewModel.downloads.value
+                        val downloads = remember(rawDownloads) {
+                            rawDownloads.sortedByDescending { it.episode.publishDateMillis }
+                        }
                         val playbackPositions = viewModel.playbackPositions.value
 
                         DownloadsScreen(
@@ -634,6 +730,47 @@ fun CalmCastApp(pipStateHolder: androidx.compose.runtime.MutableState<Boolean>, 
                         popEnterTransition = { EnterTransition.None },
                         popExitTransition = { ExitTransition.None }
                     ) {
+                        val exportLauncher = rememberLauncherForActivityResult(
+                            ActivityResultContracts.CreateDocument("text/xml")
+                        ) { uri ->
+                            if (uri != null) {
+                                val outputStream = application.contentResolver.openOutputStream(uri)
+                                if (outputStream != null) {
+                                    viewModel.exportOpml(outputStream)
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar("Subscriptions exported")
+                                    }
+                                }
+                            }
+                        }
+
+                        val importLauncher = rememberLauncherForActivityResult(
+                            ActivityResultContracts.OpenDocument()
+                        ) { uri ->
+                            if (uri != null) {
+                                viewModel.importOpml(uri) { count ->
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar("Imported $count subscriptions")
+                                    }
+                                }
+                            }
+                        }
+
+                        val settingsContext = LocalContext.current
+                        var isBatteryExempt by remember {
+                            mutableStateOf(isIgnoringBatteryOptimizations(settingsContext))
+                        }
+                        val settingsLifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+                        DisposableEffect(settingsLifecycleOwner) {
+                            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                                    isBatteryExempt = isIgnoringBatteryOptimizations(settingsContext)
+                                }
+                            }
+                            settingsLifecycleOwner.lifecycle.addObserver(observer)
+                            onDispose { settingsLifecycleOwner.lifecycle.removeObserver(observer) }
+                        }
+
                         SettingsScreen(
                             isPictureInPictureEnabled = viewModel.isPictureInPictureEnabled.value,
                             onPictureInPictureToggle = { enabled ->
@@ -679,45 +816,81 @@ fun CalmCastApp(pipStateHolder: androidx.compose.runtime.MutableState<Boolean>, 
                             isWiFiOnlyDownloadsEnabled = viewModel.isWiFiOnlyDownloadsEnabled.value,
                             onWiFiOnlyDownloadsToggle = { enabled ->
                                 viewModel.setWiFiOnlyDownloadsEnabled(enabled)
+                            },
+                            onExportOpml = {
+                                exportLauncher.launch("calmcast_subscriptions.opml")
+                            },
+                            onImportOpml = {
+                                importLauncher.launch(arrayOf("text/xml", "text/x-opml", "application/xml", "*/*"))
+                            },
+                            isSkipSilencesEnabled = viewModel.isSkipSilencesEnabled.value,
+                            onSkipSilencesToggle = { viewModel.setSkipSilencesEnabled(it) },
+                            isAutoDeletePlayedEnabled = viewModel.isAutoDeletePlayedEnabled.value,
+                            onAutoDeletePlayedToggle = { viewModel.setAutoDeletePlayedEnabled(it) },
+                            isBackgroundSyncEnabled = viewModel.isBackgroundSyncEnabled.value,
+                            onBackgroundSyncToggle = { viewModel.setBackgroundSyncEnabled(it) },
+                            isBatteryExempt = isBatteryExempt,
+                            onRequestBatteryExemption = {
+                                requestBatteryExemption(settingsContext)
+                            },
+                            storageUsage = remember(viewModel.downloads.value) {
+                                viewModel.computeStorageUsage()
+                            },
+                            onDeletePodcastDownloads = { usage ->
+                                viewModel.deletePodcastDownloads(usage.podcastId)
+                                scope.launch {
+                                    snackbarHostState.showSnackbar(
+                                        "Deleted ${usage.episodeCount} download(s) from ${usage.podcastTitle}"
+                                    )
+                                }
                             }
                         )
                     }
                 }
             }
 
-            if (viewModel.showFullPlayer.value) {
-                BackHandler {
-                    viewModel.minimizePlayer()
-                }
-                FullPlayerScreen(
-                    episode = viewModel.currentEpisode.value,
-                    artworkUrl = viewModel.currentArtworkUri.value?.toString(),
-                    isPlaying = viewModel.isPlaying.value,
-                    isLoading = viewModel.isBuffering.value,
-                    onPlayPauseClick = { viewModel.togglePlayPause() },
-                    onSeekForward = { viewModel.seekForward() },
-                    onSeekBackward = { viewModel.seekBackward() },
-                    onMinimizeClick = { viewModel.minimizePlayer() },
-                    currentPosition = viewModel.currentPosition.value,
-                    duration = viewModel.duration.value,
-                    onSeek = { positionMs -> viewModel.seekTo(positionMs) },
-                    skipSeconds = viewModel.skipSeconds.value,
-                    isKeepScreenOnEnabled = viewModel.isKeepScreenOnEnabled.value,
-                    onKeepScreenOnToggle = { enabled -> viewModel.setKeepScreenOnEnabled(enabled) },
-                    isSleepTimerActive = viewModel.isSleepTimerActive.value,
-                    sleepTimerRemainingSeconds = viewModel.sleepTimerRemainingSeconds.value,
-                    onStartSleepTimer = { viewModel.startSleepTimer() },
-                    onStopSleepTimer = { viewModel.stopSleepTimer() },
-                    onSleepTimerMinutesChange = { minutes -> viewModel.setSleepTimerMinutes(minutes) },
-                    playbackSpeed = viewModel.playbackSpeed.value,
-                    onPlaybackSpeedClick = { viewModel.cyclePlaybackSpeed() },
-                    onPlaybackSpeedChange = { speed -> viewModel.setPlaybackSpeed(speed) },
-                    isAutoPlayNextEpisodeEnabled = viewModel.isAutoPlayNextEpisodeEnabled.value,
-                    onAutoPlayNextEpisodeToggle = { enabled -> viewModel.setAutoPlayEpisodeEnabled(enabled) }
-                )
-            }
+            // Isolated in its own composable: the 1s position tick recomposes only this
+            // overlay, not the Scaffold/NavHost shell around it.
+            FullPlayerOverlay(viewModel)
         }
     }
+}
+
+@Composable
+private fun FullPlayerOverlay(viewModel: PodcastViewModel) {
+    if (!viewModel.showFullPlayer.value) return
+    BackHandler {
+        viewModel.minimizePlayer()
+    }
+    FullPlayerScreen(
+        episode = viewModel.currentEpisode.value,
+        artworkUrl = viewModel.currentArtworkUri.value?.toString(),
+        isPlaying = viewModel.isPlaying.value,
+        isLoading = viewModel.isBuffering.value,
+        onPlayPauseClick = { viewModel.togglePlayPause() },
+        onSeekForward = { viewModel.seekForward() },
+        onSeekBackward = { viewModel.seekBackward() },
+        onMinimizeClick = { viewModel.minimizePlayer() },
+        currentPosition = viewModel.currentPosition.value,
+        duration = viewModel.duration.value,
+        onSeek = { positionMs -> viewModel.seekTo(positionMs) },
+        skipSeconds = viewModel.skipSeconds.value,
+        isKeepScreenOnEnabled = viewModel.isKeepScreenOnEnabled.value,
+        onKeepScreenOnToggle = { enabled -> viewModel.setKeepScreenOnEnabled(enabled) },
+        isSleepTimerActive = viewModel.isSleepTimerActive.value,
+        sleepTimerRemainingSeconds = viewModel.sleepTimerRemainingSeconds.value,
+        onStartSleepTimer = { viewModel.startSleepTimer() },
+        onStopSleepTimer = { viewModel.stopSleepTimer() },
+        onSleepTimerMinutesChange = { minutes -> viewModel.setSleepTimerMinutes(minutes) },
+        playbackSpeed = viewModel.playbackSpeed.value,
+        onPlaybackSpeedClick = { viewModel.cyclePlaybackSpeed() },
+        onPlaybackSpeedChange = { speed -> viewModel.setPlaybackSpeed(speed) },
+        isAutoPlayNextEpisodeEnabled = viewModel.isAutoPlayNextEpisodeEnabled.value,
+        onAutoPlayNextEpisodeToggle = { enabled -> viewModel.setAutoPlayEpisodeEnabled(enabled) },
+        chapters = viewModel.chapters.value,
+        currentChapterIndex = viewModel.currentChapterIndex.value,
+        onChapterClick = { index -> viewModel.seekToChapter(index) }
+    )
 }
 
 @Composable
@@ -725,6 +898,8 @@ fun getAppBarTitle(currentRoute: String?, viewModel: PodcastViewModel): String {
     return when {
         currentRoute == "subscriptions" -> "Following"
         currentRoute == "search" -> "Search"
+        currentRoute == "queue" -> "Queue"
+        currentRoute == "history" -> "History"
         currentRoute == "downloads" -> "Downloads"
         currentRoute == "settings" -> "Settings"
         currentRoute?.startsWith("detail/") == true -> {
@@ -732,5 +907,33 @@ fun getAppBarTitle(currentRoute: String?, viewModel: PodcastViewModel): String {
         }
 
         else -> "CalmCast"
+    }
+}
+
+fun isIgnoringBatteryOptimizations(context: android.content.Context): Boolean {
+    return try {
+        val pm = context.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+        pm.isIgnoringBatteryOptimizations(context.packageName)
+    } catch (e: Exception) {
+        true
+    }
+}
+
+fun requestBatteryExemption(context: android.content.Context) {
+    try {
+        val intent = android.content.Intent(
+            android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+            android.net.Uri.parse("package:${context.packageName}")
+        )
+        context.startActivity(intent)
+    } catch (e: Exception) {
+        // Some OEM builds don't ship the direct-request dialog; fall back to the list screen
+        try {
+            context.startActivity(
+                android.content.Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+            )
+        } catch (e2: Exception) {
+            com.calmcast.podcast.util.CrashLogger.logError("MainActivity", "No battery optimization screen", e2)
+        }
     }
 }

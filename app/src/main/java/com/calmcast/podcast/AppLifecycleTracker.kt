@@ -16,11 +16,15 @@ import kotlinx.coroutines.launch
 
 object AppLifecycleTracker {
     private const val TAG = "AppLifecycleTracker"
+    // Full feed refresh is expensive on e-ink hardware; only re-run when stale.
+    private const val REFRESH_THROTTLE_MS = 15 * 60 * 1000L
     private var settingsManager: SettingsManager? = null
     private var podcastDao: PodcastDao? = null
     private var subscriptionManager: SubscriptionManager? = null
     private var onRefreshCallback: (() -> Unit)? = null
     private var apiServiceProvider: (() -> ItunesApiService)? = null
+    @Volatile
+    private var lastRefreshAtMs: Long = 0L
 
     fun setRefreshCallback(callback: (() -> Unit)?) {
         onRefreshCallback = callback
@@ -43,13 +47,19 @@ object AppLifecycleTracker {
                 Log.d(TAG, "Lifecycle event: $event, callback is null: ${onRefreshCallback == null}")
                 when (event) {
                     Lifecycle.Event.ON_START -> {
+                        val now = System.currentTimeMillis()
+                        if (now - lastRefreshAtMs < REFRESH_THROTTLE_MS) {
+                            Log.d(TAG, "ON_START: refresh skipped (refreshed ${(now - lastRefreshAtMs) / 1000}s ago)")
+                            return@LifecycleEventObserver
+                        }
+                        lastRefreshAtMs = now
                         Log.d(TAG, "ON_START triggered")
                         CoroutineScope(Dispatchers.IO).launch {
                             try {
                                 val settings = settingsManager ?: return@launch
                                 val subMgr = subscriptionManager ?: return@launch
                                 val dao = podcastDao ?: return@launch
-                                
+
                                 Log.d(TAG, "About to call refresh callback")
                                 if (onRefreshCallback != null) {
                                     Log.d(TAG, "Calling onRefreshCallback")

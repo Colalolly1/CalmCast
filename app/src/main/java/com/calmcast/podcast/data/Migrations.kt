@@ -97,4 +97,39 @@ object Migrations {
             )
         }
     }
+
+    val MIGRATION_14_15 = object : Migration(14, 15) {
+        override fun migrate(database: SupportSQLiteDatabase) {
+            database.execSQL(
+                """CREATE TABLE IF NOT EXISTS listen_history (
+                    episodeId TEXT PRIMARY KEY NOT NULL,
+                    podcastId TEXT NOT NULL,
+                    podcastTitle TEXT NOT NULL,
+                    episodeTitle TEXT NOT NULL,
+                    description TEXT,
+                    publishDate TEXT NOT NULL,
+                    publishDateMillis INTEGER NOT NULL,
+                    duration TEXT NOT NULL,
+                    audioUrl TEXT NOT NULL,
+                    downloadedPath TEXT,
+                    lastListenedAt INTEGER NOT NULL
+                )"""
+            )
+            database.execSQL(
+                """CREATE TABLE IF NOT EXISTS saved_episodes (
+                    episodeId TEXT PRIMARY KEY NOT NULL,
+                    podcastId TEXT NOT NULL,
+                    podcastTitle TEXT NOT NULL,
+                    episodeTitle TEXT NOT NULL,
+                    description TEXT,
+                    publishDate TEXT NOT NULL,
+                    publishDateMillis INTEGER NOT NULL,
+                    duration TEXT NOT NULL,
+                    audioUrl TEXT NOT NULL,
+                    downloadedPath TEXT,
+                    savedAt INTEGER NOT NULL
+                )"""
+            )
+        }
+    }
 }

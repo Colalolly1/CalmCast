@@ -134,7 +134,7 @@ fun DownloadsScreen(
             LazyColumnMMD(
                 modifier = Modifier.weight(1f),
             ) {
-                items(validDownloads.size) { index ->
+                items(validDownloads.size, key = { validDownloads[it].id }) { index ->
                     val download = validDownloads[index]
                     val playbackPosition = playbackPositions[download.episode.id]
                     val isCurrentlyPlaying = download.episode.id == currentPlayingEpisodeId

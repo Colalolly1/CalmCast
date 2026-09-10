@@ -17,6 +17,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.outlined.BookmarkBorder
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Download
@@ -24,10 +26,15 @@ import androidx.compose.material.icons.outlined.Headphones
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.FilterList
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.sharp.Clear
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.material3.Icon
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -56,6 +63,11 @@ import com.calmcast.podcast.utils.DateTimeFormatter
 import com.calmcast.podcast.ui.common.DashedDivider
 import com.mudita.mmd.components.divider.HorizontalDividerMMD
 import com.mudita.mmd.components.lazy.LazyColumnMMD
+import com.mudita.mmd.components.menus.DropdownMenuItemMMD
+import com.mudita.mmd.components.menus.DropdownMenuMMD
+import com.mudita.mmd.components.text.TextMMD
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
 import com.mudita.mmd.components.progress_indicator.CircularProgressIndicatorMMD
 import com.mudita.mmd.components.progress_indicator.LinearProgressIndicatorMMD
 
@@ -76,10 +88,57 @@ fun PodcastDetailScreen(
     onCancelClick: (Episode) -> Unit = {},
     onResumeClick: (Episode) -> Unit = {},
     onRefreshClick: () -> Unit = {},
-    removeDividers: Boolean = false
+    onSaveClick: (Episode) -> Unit = {},
+    isSaved: (String) -> Boolean = { false },
+    onMarkPlayedClick: (Episode) -> Unit = {},
+    onMarkUnplayedClick: (Episode) -> Unit = {},
+    removeDividers: Boolean = false,
+    sortOrder: String = "newest",
+    onSortOrderChange: (String) -> Unit = {},
+    episodeFilter: String = "all",
+    onEpisodeFilterChange: (String) -> Unit = {}
 ) {
     val showDescriptionModal = remember { mutableStateOf(false) }
     var isDescriptionTruncated by remember { mutableStateOf(false) }
+    var episodeSearchQuery by remember { mutableStateOf("") }
+    var showEpisodeSearch by remember { mutableStateOf(false) }
+    var showFilterMenu by remember { mutableStateOf(false) }
+
+    val downloadedEpisodeIds = remember(downloads) {
+        downloads.filter { it.status == DownloadStatus.DOWNLOADED }.map { it.episode.id }.toSet()
+    }
+
+    // Only let playback positions invalidate the list when the active filter reads them —
+    // otherwise the 10s position-save tick re-sorts the whole list during playback.
+    val positionsForFilter = if (episodeFilter == "unplayed" || episodeFilter == "in_progress") playbackPositions else emptyMap()
+
+    val filteredEpisodes = remember(episodes, episodeSearchQuery, sortOrder, episodeFilter, positionsForFilter, downloadedEpisodeIds) {
+        var result = episodes
+        if (episodeSearchQuery.isNotBlank()) {
+            result = result.filter { it.title.contains(episodeSearchQuery, ignoreCase = true) }
+        }
+        result = when (episodeFilter) {
+            "unplayed" -> result.filter { ep ->
+                val pos = playbackPositions[ep.id]
+                val durMs = (com.calmcast.podcast.utils.DateTimeFormatter.parseDuration(ep.duration) ?: 0L) * 1000L
+                // unplayed = no position OR position less than 90% of duration
+                pos == null || (durMs > 0 && pos.position < durMs * 0.9)
+            }
+            "downloaded" -> result.filter { it.id in downloadedEpisodeIds }
+            "in_progress" -> result.filter { ep ->
+                val pos = playbackPositions[ep.id] ?: return@filter false
+                val durMs = (com.calmcast.podcast.utils.DateTimeFormatter.parseDuration(ep.duration) ?: 0L) * 1000L
+                pos.position > 0 && (durMs == 0L || pos.position < durMs * 0.9)
+            }
+            else -> result
+        }
+        result = if (sortOrder == "oldest") {
+            result.sortedBy { it.publishDateMillis }
+        } else {
+            result.sortedByDescending { it.publishDateMillis }
+        }
+        result
+    }
 
     var selectedEpisodeForInfo by remember { mutableStateOf<Episode?>(null) }
 
@@ -172,7 +231,7 @@ fun PodcastDetailScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Episodes (${episodes.size})",
+                    text = if (episodeSearchQuery.isBlank()) "Episodes (${episodes.size})" else "Episodes (${filteredEpisodes.size}/${episodes.size})",
                     fontSize = 16.sp,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -188,6 +247,63 @@ fun PodcastDetailScreen(
                         )
                     }
                     IconButton(
+                        onClick = {
+                            showEpisodeSearch = !showEpisodeSearch
+                            if (!showEpisodeSearch) episodeSearchQuery = ""
+                        },
+                        modifier = Modifier.size(20.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (showEpisodeSearch) Icons.Sharp.Clear else Icons.Outlined.Search,
+                            contentDescription = if (showEpisodeSearch) "Close search" else "Search episodes",
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.size(12.dp))
+                    Box {
+                        IconButton(
+                            onClick = { showFilterMenu = true },
+                            modifier = Modifier.size(20.dp)
+                        ) {
+                            Icon(
+                                imageVector = androidx.compose.material.icons.Icons.Outlined.FilterList,
+                                contentDescription = "Filter & sort episodes",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                        DropdownMenuMMD(
+                            expanded = showFilterMenu,
+                            onDismissRequest = { showFilterMenu = false }
+                        ) {
+                            DropdownMenuItemMMD(
+                                text = { TextMMD(text = "Show: All" + if (episodeFilter == "all") " ✓" else "", fontSize = 14.sp) },
+                                onClick = { onEpisodeFilterChange("all"); showFilterMenu = false }
+                            )
+                            DropdownMenuItemMMD(
+                                text = { TextMMD(text = "Show: Unplayed" + if (episodeFilter == "unplayed") " ✓" else "", fontSize = 14.sp) },
+                                onClick = { onEpisodeFilterChange("unplayed"); showFilterMenu = false }
+                            )
+                            DropdownMenuItemMMD(
+                                text = { TextMMD(text = "Show: In Progress" + if (episodeFilter == "in_progress") " ✓" else "", fontSize = 14.sp) },
+                                onClick = { onEpisodeFilterChange("in_progress"); showFilterMenu = false }
+                            )
+                            DropdownMenuItemMMD(
+                                text = { TextMMD(text = "Show: Downloaded" + if (episodeFilter == "downloaded") " ✓" else "", fontSize = 14.sp) },
+                                onClick = { onEpisodeFilterChange("downloaded"); showFilterMenu = false }
+                            )
+                            HorizontalDividerMMD(thickness = 1.dp)
+                            DropdownMenuItemMMD(
+                                text = { TextMMD(text = "Sort: Newest first" + if (sortOrder == "newest") " ✓" else "", fontSize = 14.sp) },
+                                onClick = { onSortOrderChange("newest"); showFilterMenu = false }
+                            )
+                            DropdownMenuItemMMD(
+                                text = { TextMMD(text = "Sort: Oldest first" + if (sortOrder == "oldest") " ✓" else "", fontSize = 14.sp) },
+                                onClick = { onSortOrderChange("oldest"); showFilterMenu = false }
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.size(12.dp))
+                    IconButton(
                         onClick = onRefreshClick,
                         modifier = Modifier.size(20.dp)
                     ) {
@@ -199,6 +315,30 @@ fun PodcastDetailScreen(
                     }
                 }
             }
+
+            if (showEpisodeSearch) {
+                TextField(
+                    value = episodeSearchQuery,
+                    onValueChange = { episodeSearchQuery = it },
+                    placeholder = { Text("Search episodes...", fontSize = 14.sp) },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(end = 16.dp),
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = MaterialTheme.colorScheme.surface,
+                        unfocusedContainerColor = MaterialTheme.colorScheme.surface
+                    ),
+                    trailingIcon = {
+                        if (episodeSearchQuery.isNotEmpty()) {
+                            IconButton(onClick = { episodeSearchQuery = "" }) {
+                                Icon(Icons.Sharp.Clear, contentDescription = "Clear")
+                            }
+                        }
+                    }
+                )
+            }
+
             Spacer(modifier = Modifier.height(8.dp))
             HorizontalDividerMMD(thickness = 3.dp)
         }
@@ -211,7 +351,7 @@ fun PodcastDetailScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             when {
-                isLoadingEpisodes && episodes.isEmpty() -> {
+                isLoadingEpisodes && filteredEpisodes.isEmpty() && episodeSearchQuery.isBlank() -> {
                     item {
                         Box(
                             modifier = Modifier
@@ -224,7 +364,7 @@ fun PodcastDetailScreen(
                     }
                 }
 
-                episodes.isEmpty() -> {
+                filteredEpisodes.isEmpty() -> {
                     item {
                         Box(
                             modifier = Modifier
@@ -232,13 +372,13 @@ fun PodcastDetailScreen(
                                 .padding(32.dp),
                             contentAlignment = Alignment.Center
                         ) {
-                            Text(stringResource(R.string.no_episodes))
+                            Text(if (episodeSearchQuery.isNotBlank()) "No matching episodes" else stringResource(R.string.no_episodes))
                         }
                     }
                 }
 
                 else -> {
-                    itemsIndexed(episodes, key = { _, episode -> episode.id }) { index, episode ->
+                    itemsIndexed(filteredEpisodes, key = { _, episode -> episode.id }) { index, episode ->
                         val download = downloadsByEpisodeId[episode.id]
                         val playbackPosition = playbackPositions[episode.id]
                         val isCurrentlyPlaying = episode.id == currentPlayingEpisodeId
@@ -246,7 +386,7 @@ fun PodcastDetailScreen(
                         EpisodeItem(
                             episode = episode,
                             download = download,
-                            isLastItem = index == episodes.lastIndex,
+                            isLastItem = index == filteredEpisodes.lastIndex,
                             playbackPosition = playbackPosition,
                             isCurrentlyPlaying = isCurrentlyPlaying,
                             isBuffering = isBuffering && isCurrentlyPlaying,
@@ -256,7 +396,11 @@ fun PodcastDetailScreen(
                             onPauseClick = { onPauseClick(episode) },
                             onCancelClick = { onCancelClick(episode) },
                             onResumeClick = { onResumeClick(episode) },
-                            onInfoClick = { selectedEpisodeForInfo = episode }, // Pass event up
+                            onInfoClick = { selectedEpisodeForInfo = episode },
+                            onSaveClick = { onSaveClick(episode) },
+                            isSaved = isSaved(episode.id),
+                            onMarkPlayedClick = { onMarkPlayedClick(episode) },
+                            onMarkUnplayedClick = { onMarkUnplayedClick(episode) },
                             removeDividers = removeDividers,
                         )
                     }
@@ -283,6 +427,10 @@ fun EpisodeItem(
     onCancelClick: () -> Unit = {},
     onResumeClick: () -> Unit = {},
     onInfoClick: () -> Unit = {},
+    onSaveClick: () -> Unit = {},
+    isSaved: Boolean = false,
+    onMarkPlayedClick: () -> Unit = {},
+    onMarkUnplayedClick: () -> Unit = {},
     removeDividers: Boolean = false,
     customPaddingValues: PaddingValues? = null
 ) {
@@ -313,11 +461,43 @@ fun EpisodeItem(
         }
     }
 
+    var showContextMenu by remember { mutableStateOf(false) }
+    val hasProgress = (playbackPosition?.position ?: 0L) > 0L
+
     Column(
         modifier = Modifier
             .padding(start = 0.dp, end = 0.dp, top = 0.dp, bottom = 0.dp)
-            .clickable(onClick = onClick)
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = { onClick() },
+                    onLongPress = { showContextMenu = true }
+                )
+            }
     ) {
+        Box {
+            DropdownMenuMMD(
+                expanded = showContextMenu,
+                onDismissRequest = { showContextMenu = false }
+            ) {
+                if (hasProgress) {
+                    DropdownMenuItemMMD(
+                        text = { TextMMD("Mark as unplayed") },
+                        onClick = {
+                            onMarkUnplayedClick()
+                            showContextMenu = false
+                        }
+                    )
+                }
+                DropdownMenuItemMMD(
+                    text = { TextMMD("Mark as played") },
+                    onClick = {
+                        onMarkPlayedClick()
+                        showContextMenu = false
+                    }
+                )
+            }
+        }
+
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -435,7 +615,18 @@ fun EpisodeItem(
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f)
                         )
+                        IconButton(
+                            onClick = onSaveClick,
+                            modifier = Modifier.size(20.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isSaved) Icons.Filled.Bookmark else Icons.Outlined.BookmarkBorder,
+                                contentDescription = if (isSaved) "Remove from queue" else "Add to queue",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
                         if (!episode.description.isNullOrEmpty()) {
+                            Spacer(modifier = Modifier.size(8.dp))
                             IconButton(
                                 onClick = onInfoClick,
                                 modifier = Modifier.size(20.dp)
@@ -537,6 +728,21 @@ fun EpisodeItem(
                                     text = durationText,
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.Normal
+                                )
+                            }
+
+                            val listenProgress = remember(playbackPosition?.position, episode.duration) {
+                                val position = playbackPosition?.position ?: 0L
+                                if (position <= 0) return@remember 0f
+                                val totalSeconds = DateTimeFormatter.parseDuration(episode.duration) ?: return@remember 0f
+                                if (totalSeconds <= 0) return@remember 0f
+                                (position.toFloat() / (totalSeconds * 1000f)).coerceIn(0f, 1f)
+                            }
+                            if (listenProgress > 0f) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                LinearProgressIndicatorMMD(
+                                    progress = { listenProgress },
+                                    modifier = Modifier.fillMaxWidth()
                                 )
                             }
                         }

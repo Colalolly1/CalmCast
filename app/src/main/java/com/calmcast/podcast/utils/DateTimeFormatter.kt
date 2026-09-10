@@ -124,6 +124,25 @@ object DateTimeFormatter {
         }
     }
 
+    fun formatRelativeTime(timestampMs: Long): String {
+        val now = System.currentTimeMillis()
+        val diffMs = now - timestampMs
+        val diffMinutes = diffMs / 60_000
+        val diffHours = diffMinutes / 60
+        val diffDays = diffHours / 24
+
+        return when {
+            diffMinutes < 1 -> "Just now"
+            diffMinutes < 60 -> "${diffMinutes}m ago"
+            diffHours < 24 -> "${diffHours}h ago"
+            diffDays < 7 -> "${diffDays}d ago"
+            else -> {
+                val sdf = SimpleDateFormat("MM/dd/yyyy", Locale.US)
+                sdf.format(Date(timestampMs))
+            }
+        }
+    }
+
     fun formatPlaybackTime(currentPosition: Long, totalDuration: Long): String {
         val currentSeconds = currentPosition / 1000
         val totalSeconds = totalDuration / 1000
@@ -148,26 +167,11 @@ object DateTimeFormatter {
             // Not a Unix timestamp, continue to try other formats
         }
 
-        val formats = listOf(
-            "yyyy-MM-dd'T'HH:mm:ss'Z'",           // ISO 8601 (UTC)
-            "yyyy-MM-dd'T'HH:mm:ssX",              // ISO 8601 with timezone
-            "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",        // ISO 8601 with milliseconds
-            "yyyy-MM-dd'T'HH:mm:ss.SSSZ",          // ISO 8601 with milliseconds and timezone
-            "EEE, dd MMM yyyy HH:mm:ss Z",         // RFC 2822 (common in RSS)
-            "dd MMM yyyy HH:mm:ss Z",              // Alternative RFC format
-            "yyyy-MM-dd HH:mm:ss",                 // Simple format
-            "yyyy-MM-dd",                          // Date only
-            "MMM dd, yyyy",                        // Short format
-            "MMMM dd, yyyy"                        // Long format
-        )
-
         var lastException: Exception? = null
 
-        for (format in formats) {
+        for (sdf in dateFormatsCache.get()!!) {
             try {
-                val sdf = SimpleDateFormat(format, Locale.getDefault())
-                sdf.isLenient = false
-                return sdf.parse(dateStr) ?: Date()
+                return synchronized(sdf) { sdf.parse(dateStr) } ?: Date()
             } catch (e: Exception) {
                 lastException = e
                 continue
@@ -175,5 +179,25 @@ object DateTimeFormatter {
         }
 
         throw lastException ?: Exception("Unable to parse date: $dateStr")
+    }
+
+    // RFC 2822 first (the overwhelming majority of RSS feeds), then ISO variants.
+    // Locale.US is required: month/day names in RSS are English by spec, so a
+    // non-English device locale would fail every parse and zero out all dates.
+    // Cached per thread — SimpleDateFormat isn't thread-safe, and re-allocating
+    // ten of them per episode was a measurable cost during feed refresh.
+    private val dateFormatsCache = object : ThreadLocal<List<SimpleDateFormat>>() {
+        override fun initialValue(): List<SimpleDateFormat> = listOf(
+            "EEE, dd MMM yyyy HH:mm:ss Z",         // RFC 2822 (common in RSS)
+            "dd MMM yyyy HH:mm:ss Z",              // Alternative RFC format
+            "yyyy-MM-dd'T'HH:mm:ss'Z'",            // ISO 8601 (UTC)
+            "yyyy-MM-dd'T'HH:mm:ssX",              // ISO 8601 with timezone
+            "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",        // ISO 8601 with milliseconds
+            "yyyy-MM-dd'T'HH:mm:ss.SSSZ",          // ISO 8601 with milliseconds and timezone
+            "yyyy-MM-dd HH:mm:ss",                 // Simple format
+            "yyyy-MM-dd",                          // Date only
+            "MMM dd, yyyy",                        // Short format
+            "MMMM dd, yyyy"                        // Long format
+        ).map { SimpleDateFormat(it, Locale.US).apply { isLenient = false } }
     }
 }

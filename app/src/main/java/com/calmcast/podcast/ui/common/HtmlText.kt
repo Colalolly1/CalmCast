@@ -7,6 +7,7 @@ import android.text.style.ForegroundColorSpan
 import android.text.style.URLSpan
 import android.widget.TextView
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 
@@ -18,6 +19,22 @@ fun HtmlText(
     forceBlackText: Boolean = false,
     onTruncated: (Boolean) -> Unit = {}
 ) {
+    // Parsing HTML is expensive; do it once per html value, not on every recomposition
+    // (the update block re-runs each time the enclosing screen recomposes).
+    val spanned = remember(html, forceBlackText) {
+        val parsed = Html.fromHtml(html, Html.FROM_HTML_MODE_COMPACT)
+        if (forceBlackText && parsed is Spannable) {
+            // Remove color spans and URL spans to force black text
+            val spans = parsed.getSpans(0, parsed.length, Any::class.java)
+            for (span in spans) {
+                if (span is ForegroundColorSpan || span is URLSpan) {
+                    parsed.removeSpan(span)
+                }
+            }
+        }
+        parsed
+    }
+
     AndroidView(
         modifier = modifier,
         factory = { context ->
@@ -30,17 +47,9 @@ fun HtmlText(
             }
         },
         update = { textView ->
-            val spanned = Html.fromHtml(html, Html.FROM_HTML_MODE_COMPACT)
-            if (forceBlackText && spanned is Spannable) {
-                // Remove color spans and URL spans to force black text
-                val spans = spanned.getSpans(0, spanned.length, Any::class.java)
-                for (span in spans) {
-                    if (span is ForegroundColorSpan || span is URLSpan) {
-                        spanned.removeSpan(span)
-                    }
-                }
+            if (textView.text != spanned) {
+                textView.text = spanned
             }
-            textView.text = spanned
             if (maxLines != null) {
                 textView.post {
                     val layout = textView.layout

@@ -28,6 +28,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.lazy.itemsIndexed
 import com.calmcast.podcast.data.PodcastRepository.Episode
 import com.calmcast.podcast.ui.common.DashedDivider
 import com.calmcast.podcast.utils.DateTimeFormatter
@@ -112,6 +113,7 @@ fun MiniPlayer(
 }
 
 @SuppressLint("DefaultLocale")
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FullPlayerScreen(
     episode: Episode?,
@@ -137,12 +139,16 @@ fun FullPlayerScreen(
     onPlaybackSpeedClick: () -> Unit = {},
     onPlaybackSpeedChange: (Float) -> Unit = {},
     isAutoPlayNextEpisodeEnabled: Boolean = false,
-    onAutoPlayNextEpisodeToggle: (Boolean) -> Unit = {}
+    onAutoPlayNextEpisodeToggle: (Boolean) -> Unit = {},
+    chapters: List<com.calmcast.podcast.data.Chapter> = emptyList(),
+    currentChapterIndex: Int = -1,
+    onChapterClick: (Int) -> Unit = {}
 ) {
     if (episode == null) return
-    
+
     var speedMenuExpanded by remember { mutableStateOf(false) }
     var sleepMenuExpanded by remember { mutableStateOf(false) }
+    var chaptersSheetOpen by remember { mutableStateOf(false) }
 
     var isArtworkFlashing by remember { mutableStateOf(false) }
 
@@ -253,6 +259,38 @@ fun FullPlayerScreen(
         Spacer(modifier = Modifier.height(32.dp))
 
         if (!isKeepScreenOnEnabled) {
+            // Show current chapter (if any) with tap-to-open-chapter-list
+            if (chapters.isNotEmpty()) {
+                val currentChapter = chapters.getOrNull(currentChapterIndex)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { chaptersSheetOpen = true }
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Chapter ${(currentChapterIndex + 1).coerceAtLeast(1)} of ${chapters.size}",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Normal
+                        )
+                        Text(
+                            text = currentChapter?.title ?: chapters.firstOrNull()?.title.orEmpty(),
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Text(
+                        text = "View all >",
+                        fontSize = 12.sp
+                    )
+                }
+            }
+
             Column(
                 modifier = Modifier.fillMaxWidth(),
             ) {
@@ -527,4 +565,71 @@ fun FullPlayerScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
     }
+
+    if (chaptersSheetOpen) {
+        com.mudita.mmd.components.bottom_sheet.ModalBottomSheetMMD(
+            onDismissRequest = { chaptersSheetOpen = false }
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 16.dp)
+            ) {
+                Text(
+                    text = "Chapters",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                com.mudita.mmd.components.lazy.LazyColumnMMD(
+                    modifier = Modifier.heightIn(max = 480.dp)
+                ) {
+                    itemsIndexed(chapters) { index, chapter ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    onChapterClick(index)
+                                    chaptersSheetOpen = false
+                                }
+                                .padding(vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = formatTime(chapter.startTimeMs),
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(end = 12.dp)
+                            )
+                            Text(
+                                text = chapter.title,
+                                fontSize = 14.sp,
+                                fontWeight = if (index == currentChapterIndex) FontWeight.Bold else FontWeight.Normal,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (index == currentChapterIndex) {
+                                Text(
+                                    text = "▶",
+                                    fontSize = 14.sp
+                                )
+                            }
+                        }
+                        if (index < chapters.lastIndex) {
+                            HorizontalDividerMMD(thickness = 1.dp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun formatTime(ms: Long): String {
+    val totalSec = ms / 1000
+    val h = totalSec / 3600
+    val m = (totalSec % 3600) / 60
+    val s = totalSec % 60
+    return if (h > 0) String.format("%d:%02d:%02d", h, m, s)
+    else String.format("%d:%02d", m, s)
 }

@@ -8,6 +8,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.PICTURE_IN_PICTURE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Required for ExoPlayer setWakeMode(WAKE_MODE_NETWORK) so streaming doesn't
+         stall when the screen turns off and the device enters deep sleep. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Lets the user exempt the app from battery optimization so the OS stops
+         killing background playback (Settings -> Player -> background playback). -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="29" />

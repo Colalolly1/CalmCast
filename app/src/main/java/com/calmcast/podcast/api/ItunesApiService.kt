@@ -7,7 +7,6 @@ import kotlinx.coroutines.withContext
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.logging.HttpLoggingInterceptor
 import okhttp3.Response
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
@@ -25,10 +24,6 @@ class ItunesApiService(private val client: OkHttpClient = defaultClient()) {
                     .header("User-Agent", "CalmCast/1.0 (Android; Podcast Player)")
                     .build()
                 chain.proceed(requestWithUserAgent)
-            })
-            .addInterceptor(HttpLoggingInterceptor { message ->
-            }.apply {
-                level = HttpLoggingInterceptor.Level.BODY
             })
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
@@ -59,11 +54,12 @@ class ItunesApiService(private val client: OkHttpClient = defaultClient()) {
 
             val response = client.newCall(request).execute()
 
-            if (!response.isSuccessful) {
-                throw Exception("API request failed with code ${response.code}: ${response.message}")
+            response.use {
+            if (!it.isSuccessful) {
+                throw Exception("API request failed with code ${it.code}: ${it.message}")
             }
 
-            val responseBody = response.body?.string()
+            val responseBody = it.body?.string()
                 ?: throw Exception("Empty response body")
 
             val jsonObject = JsonParser.parseString(responseBody).asJsonObject
@@ -95,6 +91,7 @@ class ItunesApiService(private val client: OkHttpClient = defaultClient()) {
             }
             
             Result.success(ItunesPodcastSearchResponse(results = podcasts))
+            } // response.use
         } catch (e: Exception) {
             Log.e("ItunesApi", "Error searching podcasts", e)
             Result.failure(e)
@@ -115,20 +112,22 @@ class ItunesApiService(private val client: OkHttpClient = defaultClient()) {
                     .build()
 
                 val response = client.newCall(request).execute()
-                if (!response.isSuccessful) {
-                    Log.e("ItunesApi", "Failed to fetch RSS: ${response.code} ${response.message}")
-                    when (response.code) {
-                        404 -> throw FeedNotFoundException("Podcast feed not found (404)")
-                        410 -> throw FeedGoneException("Podcast feed is no longer available (410)")
-                        403 -> throw FeedGoneException("Podcast feed access denied (403)")
-                        else -> throw Exception("Failed to fetch RSS feed: ${response.code}")
+                response.use {
+                    if (!it.isSuccessful) {
+                        Log.e("ItunesApi", "Failed to fetch RSS: ${it.code} ${it.message}")
+                        when (it.code) {
+                            404 -> throw FeedNotFoundException("Podcast feed not found (404)")
+                            410 -> throw FeedGoneException("Podcast feed is no longer available (410)")
+                            403 -> throw FeedGoneException("Podcast feed access denied (403)")
+                            else -> throw Exception("Failed to fetch RSS feed: ${it.code}")
+                        }
                     }
-                }
 
-                val feedBody = response.body?.string()
-                    ?: throw Exception("Empty feed response")
-                val parseResult = parseRssFeed(feedBody)
-                Result.success(ItunesPodcastDetailsResponse(episodes = parseResult.episodes, description = parseResult.description))
+                    val feedBody = it.body?.string()
+                        ?: throw Exception("Empty feed response")
+                    val parseResult = parseRssFeed(feedBody)
+                    Result.success(ItunesPodcastDetailsResponse(episodes = parseResult.episodes, description = parseResult.description))
+                }
             } catch (e: Exception) {
                 Log.e("ItunesApi", "Error fetching podcast details for $podcastId", e)
                 Result.failure(e)
@@ -145,31 +144,33 @@ class ItunesApiService(private val client: OkHttpClient = defaultClient()) {
 
                 val response = client.newCall(request).execute()
 
-                if (!response.isSuccessful) {
-                    Log.e("ItunesApi", "Failed to fetch RSS: ${response.code} ${response.message}")
-                    when (response.code) {
-                        404 -> throw FeedNotFoundException("Podcast feed not found (404)")
-                        410 -> throw FeedGoneException("Podcast feed is no longer available (410)")
-                        403 -> throw FeedGoneException("Podcast feed access denied (403)")
-                        else -> throw Exception("Failed to fetch RSS feed: ${response.code}")
+                response.use {
+                    if (!it.isSuccessful) {
+                        Log.e("ItunesApi", "Failed to fetch RSS: ${it.code} ${it.message}")
+                        when (it.code) {
+                            404 -> throw FeedNotFoundException("Podcast feed not found (404)")
+                            410 -> throw FeedGoneException("Podcast feed is no longer available (410)")
+                            403 -> throw FeedGoneException("Podcast feed access denied (403)")
+                            else -> throw Exception("Failed to fetch RSS feed: ${it.code}")
+                        }
                     }
+
+                    val feedBody = it.body?.string()
+                        ?: throw Exception("Empty feed response")
+
+                    val parseResult = parseRssFeed(feedBody)
+                    val podcastId = feedUrl.hashCode().toString()
+
+                    val podcast = CustomRSSPodcast(
+                        id = podcastId,
+                        title = parseResult.title.ifEmpty { "Unnamed Podcast" },
+                        author = parseResult.author.ifEmpty { "Unknown" },
+                        description = parseResult.description,
+                        imageUrl = parseResult.imageUrl,
+                        feedUrl = feedUrl
+                    )
+                    Result.success(podcast)
                 }
-
-                val feedBody = response.body?.string()
-                    ?: throw Exception("Empty feed response")
-
-                val parseResult = parseRssFeed(feedBody)
-                val podcastId = feedUrl.hashCode().toString()
-                
-                val podcast = CustomRSSPodcast(
-                    id = podcastId,
-                    title = parseResult.title.ifEmpty { "Unnamed Podcast" },
-                    author = parseResult.author.ifEmpty { "Unknown" },
-                    description = parseResult.description,
-                    imageUrl = parseResult.imageUrl,
-                    feedUrl = feedUrl
-                )
-                Result.success(podcast)
             } catch (e: Exception) {
                 Log.e("ItunesApi", "Error fetching podcast from RSS URL", e)
                 Result.failure(e)

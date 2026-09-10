@@ -9,13 +9,15 @@ import androidx.room.TypeConverters
 import com.calmcast.podcast.data.download.Download
 import com.calmcast.podcast.data.download.DownloadDao
 
-@Database(entities = [com.calmcast.podcast.data.Podcast::class, com.calmcast.podcast.data.PlaybackPosition::class, Download::class], version = 14)
+@Database(entities = [com.calmcast.podcast.data.Podcast::class, com.calmcast.podcast.data.PlaybackPosition::class, Download::class, ListenHistory::class, SavedEpisode::class], version = 15)
 @TypeConverters(com.calmcast.podcast.data.DateConverter::class)
 abstract class PodcastDatabase : RoomDatabase() {
 
     abstract fun podcastDao(): PodcastDao
     abstract fun playbackPositionDao(): PlaybackPositionDao
     abstract fun downloadDao(): DownloadDao
+    abstract fun listenHistoryDao(): ListenHistoryDao
+    abstract fun savedEpisodeDao(): SavedEpisodeDao
 
     companion object {
         @Volatile
@@ -29,7 +31,7 @@ abstract class PodcastDatabase : RoomDatabase() {
                         PodcastDatabase::class.java,
                         "podcast_database"
                     )
-                        .addMigrations(Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8, Migrations.MIGRATION_8_9, Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11, Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13, Migrations.MIGRATION_13_14)
+                        .addMigrations(Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8, Migrations.MIGRATION_8_9, Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11, Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13, Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15)
                         .fallbackToDestructiveMigration()
                         .build()
                     INSTANCE = instance
@@ -50,7 +52,7 @@ abstract class PodcastDatabase : RoomDatabase() {
                         PodcastDatabase::class.java,
                         "podcast_database"
                     )
-.addMigrations(Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8, Migrations.MIGRATION_8_9, Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11, Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13, Migrations.MIGRATION_13_14)
+.addMigrations(Migrations.MIGRATION_6_7, Migrations.MIGRATION_7_8, Migrations.MIGRATION_8_9, Migrations.MIGRATION_9_10, Migrations.MIGRATION_10_11, Migrations.MIGRATION_11_12, Migrations.MIGRATION_12_13, Migrations.MIGRATION_13_14, Migrations.MIGRATION_14_15)
                         .fallbackToDestructiveMigration()
                         .build()
                     INSTANCE = retryInstance

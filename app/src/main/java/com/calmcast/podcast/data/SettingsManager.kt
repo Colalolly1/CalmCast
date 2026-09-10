@@ -53,6 +53,21 @@ class SettingsManager(context: Context) {
     private val _isWiFiOnlyDownloadsEnabled = MutableStateFlow(isWiFiOnlyDownloadsEnabledSync())
     val isWiFiOnlyDownloadsEnabled = _isWiFiOnlyDownloadsEnabled.asStateFlow()
 
+    private val _isSkipSilencesEnabled = MutableStateFlow(isSkipSilencesEnabledSync())
+    val isSkipSilencesEnabled = _isSkipSilencesEnabled.asStateFlow()
+
+    private val _isAutoDeletePlayedEnabled = MutableStateFlow(isAutoDeletePlayedEnabledSync())
+    val isAutoDeletePlayedEnabled = _isAutoDeletePlayedEnabled.asStateFlow()
+
+    private val _episodeSortOrder = MutableStateFlow(getEpisodeSortOrderSync())
+    val episodeSortOrder = _episodeSortOrder.asStateFlow()
+
+    private val _episodeFilter = MutableStateFlow(getEpisodeFilterSync())
+    val episodeFilter = _episodeFilter.asStateFlow()
+
+    private val _isBackgroundSyncEnabled = MutableStateFlow(isBackgroundSyncEnabledSync())
+    val isBackgroundSyncEnabled = _isBackgroundSyncEnabled.asStateFlow()
+
 
     fun setPictureInPictureEnabled(enabled: Boolean) {
         sharedPreferences.edit { putBoolean(KEY_PIP, enabled) }
@@ -163,6 +178,51 @@ class SettingsManager(context: Context) {
         return sharedPreferences.getBoolean(KEY_WIFI_ONLY_DOWNLOADS, true)
     }
 
+    fun setSkipSilencesEnabled(enabled: Boolean) {
+        sharedPreferences.edit { putBoolean(KEY_SKIP_SILENCES, enabled) }
+        _isSkipSilencesEnabled.value = enabled
+    }
+
+    fun isSkipSilencesEnabledSync(): Boolean {
+        return sharedPreferences.getBoolean(KEY_SKIP_SILENCES, false)
+    }
+
+    fun setAutoDeletePlayedEnabled(enabled: Boolean) {
+        sharedPreferences.edit { putBoolean(KEY_AUTO_DELETE_PLAYED, enabled) }
+        _isAutoDeletePlayedEnabled.value = enabled
+    }
+
+    fun isAutoDeletePlayedEnabledSync(): Boolean {
+        return sharedPreferences.getBoolean(KEY_AUTO_DELETE_PLAYED, false)
+    }
+
+    fun setEpisodeSortOrder(order: String) {
+        sharedPreferences.edit { putString(KEY_EPISODE_SORT_ORDER, order) }
+        _episodeSortOrder.value = order
+    }
+
+    fun getEpisodeSortOrderSync(): String {
+        return sharedPreferences.getString(KEY_EPISODE_SORT_ORDER, "newest") ?: "newest"
+    }
+
+    fun setEpisodeFilter(filter: String) {
+        sharedPreferences.edit { putString(KEY_EPISODE_FILTER, filter) }
+        _episodeFilter.value = filter
+    }
+
+    fun getEpisodeFilterSync(): String {
+        return sharedPreferences.getString(KEY_EPISODE_FILTER, "all") ?: "all"
+    }
+
+    fun setBackgroundSyncEnabled(enabled: Boolean) {
+        sharedPreferences.edit { putBoolean(KEY_BACKGROUND_SYNC, enabled) }
+        _isBackgroundSyncEnabled.value = enabled
+    }
+
+    fun isBackgroundSyncEnabledSync(): Boolean {
+        return sharedPreferences.getBoolean(KEY_BACKGROUND_SYNC, true)
+    }
+
     fun saveLastPlayedEpisode(episode: Episode, contextName: String) {
         sharedPreferences.edit {
             putString(KEY_LAST_EP_ID, episode.id)
@@ -221,6 +281,11 @@ class SettingsManager(context: Context) {
         private const val KEY_PLAYBACK_SPEED = "playback_speed"
         private const val KEY_AUTOPLAY_NEXT_EPISODE = "auto_play_next_episode"
         private const val KEY_WIFI_ONLY_DOWNLOADS = "wifi_only_downloads"
+        private const val KEY_SKIP_SILENCES = "skip_silences_enabled"
+        private const val KEY_AUTO_DELETE_PLAYED = "auto_delete_played_enabled"
+        private const val KEY_EPISODE_SORT_ORDER = "episode_sort_order"
+        private const val KEY_EPISODE_FILTER = "episode_filter"
+        private const val KEY_BACKGROUND_SYNC = "background_sync_enabled"
 
         private const val KEY_LAST_EP_ID = "last_played_ep_id"
         private const val KEY_LAST_EP_PODCAST_ID = "last_played_ep_podcast_id"

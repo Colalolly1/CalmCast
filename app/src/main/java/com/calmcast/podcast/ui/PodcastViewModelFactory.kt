@@ -4,8 +4,10 @@ import android.app.Application
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.calmcast.podcast.CalmCastApplication
+import com.calmcast.podcast.data.ListenHistoryDao
 import com.calmcast.podcast.data.PlaybackPositionDao
 import com.calmcast.podcast.data.PodcastDao
+import com.calmcast.podcast.data.SavedEpisodeDao
 import com.calmcast.podcast.data.SettingsManager
 import com.calmcast.podcast.data.download.DownloadDao
 
@@ -14,6 +16,8 @@ class PodcastViewModelFactory(
     private val podcastDao: PodcastDao,
     private val playbackPositionDao: PlaybackPositionDao,
     private val downloadDao: DownloadDao,
+    private val listenHistoryDao: ListenHistoryDao,
+    private val savedEpisodeDao: SavedEpisodeDao,
     private val settingsManager: SettingsManager
 ) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
@@ -25,6 +29,8 @@ class PodcastViewModelFactory(
                 podcastDao,
                 playbackPositionDao,
                 downloadDao,
+                listenHistoryDao,
+                savedEpisodeDao,
                 app.downloadManager,
                 settingsManager
             ) as T

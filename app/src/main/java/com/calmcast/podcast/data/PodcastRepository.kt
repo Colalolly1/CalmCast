@@ -8,7 +8,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import java.util.Collections
 import java.util.Date
+import java.util.concurrent.ConcurrentHashMap
 
 class PodcastRepository(
     private val apiService: ItunesApiService,
@@ -16,10 +18,8 @@ class PodcastRepository(
     private val podcastDao: PodcastDao,
     private val playbackPositionDao: PlaybackPositionDao?
 ) {
-    // In-memory cache for episode lists
-    private val episodeCache = mutableMapOf<String, PodcastWithEpisodes>()
-    // Track which podcasts have cache invalidation requested
-    private val invalidationRequests = mutableSetOf<String>()
+    private val episodeCache = ConcurrentHashMap<String, PodcastWithEpisodes>()
+    private val invalidationRequests: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap())
 
     /**
      * Invalidate cache for all podcasts. Called when app is initialized or foregrounded.
@@ -210,7 +210,11 @@ class PodcastRepository(
 
                     podcastDao.insertPodcast(updatedPodcast)
 
-                    val episodesSorted = episodes.sortedByDescending { it.publishDateMillis }
+                    // Duplicate feed items (or hashCode collisions) produce duplicate ids,
+                    // which crash LazyColumn's keyed items — keep the first of each id.
+                    val episodesSorted = episodes
+                        .distinctBy { it.id }
+                        .sortedByDescending { it.publishDateMillis }
                     val podcastWithEpisodes = PodcastWithEpisodes(updatedPodcast, episodesSorted)
                     episodeCache[podcastId] = podcastWithEpisodes
                     emit(Result.success(podcastWithEpisodes))

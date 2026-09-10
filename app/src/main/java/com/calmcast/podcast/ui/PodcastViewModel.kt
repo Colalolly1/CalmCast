@@ -13,9 +13,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Metadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.PlaybackParameters
+import androidx.media3.extractor.metadata.id3.ChapterFrame
+import androidx.media3.extractor.metadata.id3.TextInformationFrame
+import androidx.media3.extractor.metadata.id3.UrlLinkFrame
+import androidx.media3.extractor.metadata.id3.ApicFrame
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.calmcast.podcast.CalmCastApplication
@@ -23,6 +28,9 @@ import com.calmcast.podcast.PlaybackService
 import com.calmcast.podcast.PlaybackError
 import com.calmcast.podcast.api.FeedGoneException
 import com.calmcast.podcast.api.FeedNotFoundException
+import com.calmcast.podcast.data.ListenHistory
+import com.calmcast.podcast.data.ListenHistoryDao
+import com.calmcast.podcast.data.OpmlManager
 import com.calmcast.podcast.data.NowPlayingStorage
 import com.calmcast.podcast.data.PodcastSnapshot
 import com.calmcast.podcast.data.PlaybackPosition
@@ -32,6 +40,8 @@ import com.calmcast.podcast.data.PodcastDao
 import com.calmcast.podcast.data.PodcastRepository
 import com.calmcast.podcast.data.PodcastRepository.Episode
 import com.calmcast.podcast.data.PodcastRepository.PodcastWithEpisodes
+import com.calmcast.podcast.data.SavedEpisode
+import com.calmcast.podcast.data.SavedEpisodeDao
 import com.calmcast.podcast.data.SettingsManager
 import com.calmcast.podcast.data.SubscriptionManager
 import com.calmcast.podcast.data.DownloadLocation
@@ -51,12 +61,14 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.Cache
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
-import okhttp3.logging.HttpLoggingInterceptor
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -65,6 +77,8 @@ class PodcastViewModel(
     private val podcastDao: PodcastDao,
     private val playbackPositionDao: PlaybackPositionDao,
     private val downloadDao: DownloadDao,
+    private val listenHistoryDao: ListenHistoryDao,
+    private val savedEpisodeDao: SavedEpisodeDao,
     private val downloadManager: DownloadManager,
     private val settingsManager: SettingsManager
 ) : ViewModel() {
@@ -72,6 +86,8 @@ class PodcastViewModel(
     companion object {
         private const val TAG = "PodcastViewModel"
         private const val SEARCH_DEBOUNCE_MS = 500L
+        // Survives ViewModel destruction so final saves can complete off the main thread.
+        private val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     }
 
     private val subscriptionManager = SubscriptionManager(application, podcastDao)
@@ -195,11 +211,46 @@ class PodcastViewModel(
     private val _isWiFiOnlyDownloadsEnabled = mutableStateOf(false)
     val isWiFiOnlyDownloadsEnabled: State<Boolean> = _isWiFiOnlyDownloadsEnabled
 
+    private val _isSkipSilencesEnabled = mutableStateOf(false)
+    val isSkipSilencesEnabled: State<Boolean> = _isSkipSilencesEnabled
+
+    private val _isAutoDeletePlayedEnabled = mutableStateOf(false)
+    val isAutoDeletePlayedEnabled: State<Boolean> = _isAutoDeletePlayedEnabled
+
+    private val _isBackgroundSyncEnabled = mutableStateOf(true)
+    val isBackgroundSyncEnabled: State<Boolean> = _isBackgroundSyncEnabled
+
+    private val _episodeSortOrder = mutableStateOf("newest")
+    val episodeSortOrder: State<String> = _episodeSortOrder
+
+    private val _episodeFilter = mutableStateOf("all")
+    val episodeFilter: State<String> = _episodeFilter
+
+    private val _chapters = mutableStateOf<List<com.calmcast.podcast.data.Chapter>>(emptyList())
+    val chapters: State<List<com.calmcast.podcast.data.Chapter>> = _chapters
+
+    private val _currentChapterIndex = mutableIntStateOf(-1)
+    val currentChapterIndex: State<Int> = _currentChapterIndex
+
     private val _isFetchingLatestEpisodes = mutableStateOf(false)
     val isFetchingLatestEpisodes: State<Boolean> = _isFetchingLatestEpisodes
 
+    private val _listenHistory = mutableStateOf<List<ListenHistory>>(emptyList())
+    val listenHistory: State<List<ListenHistory>> = _listenHistory
+
+    private val _savedEpisodes = mutableStateOf<List<SavedEpisode>>(emptyList())
+    val savedEpisodes: State<List<SavedEpisode>> = _savedEpisodes
+
+    private val _savedEpisodeIds = mutableStateOf<Set<String>>(emptySet())
+    val savedEpisodeIds: State<Set<String>> = _savedEpisodeIds
+
     private var searchJob: Job? = null
     private var sleepTimerJob: Job? = null
+    private var recoveryJob: Job? = null
+    private var detailFetchJob: Job? = null
+    private var lastQueueAdvanceAtMs = 0L
+    private var rapidQueueAdvances = 0
+    private val queueMutex = kotlinx.coroutines.sync.Mutex()
     private var lastSaveTime: Long = 0L
     private val SAVE_INTERVAL_MS = 10000L // 10 seconds
 
@@ -223,11 +274,6 @@ class PodcastViewModel(
                     .build()
                 chain.proceed(requestWithUserAgent)
             })
-            .addInterceptor(HttpLoggingInterceptor { message ->
-
-            }.apply {
-                level = HttpLoggingInterceptor.Level.BODY
-            })
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
@@ -237,11 +283,13 @@ class PodcastViewModel(
     init {
         cleanupInvalidDownloads()
         loadInitialData()
-        restoreState() // Restore playback state on cold start
+        restoreState()
         observeDownloads()
         initializeMediaController()
         registerPlaybackServiceErrorCallback()
         loadSettings()
+        loadListenHistory()
+        loadSavedEpisodes()
     }
 
     private fun cleanupInvalidDownloads() {
@@ -265,8 +313,14 @@ class PodcastViewModel(
         _isSleepTimerActive.value = settingsManager.isSleepTimerActiveSync()
         _downloadLocation.value = settingsManager.getDownloadLocationSync()
         _playbackSpeed.value = settingsManager.getPlaybackSpeedSync()
-        _isExternalStorageAvailable.value = StorageManager.isExternalStorageAvailable(application)
         _isWiFiOnlyDownloadsEnabled.value = settingsManager.isWiFiOnlyDownloadsEnabledSync()
+        // Storage probe touches the filesystem — keep it off the main thread during startup
+        viewModelScope.launch(Dispatchers.IO) {
+            val available = StorageManager.isExternalStorageAvailable(application)
+            withContext(Dispatchers.Main) {
+                _isExternalStorageAvailable.value = available
+            }
+        }
 
         viewModelScope.launch {
             settingsManager.isPictureInPictureEnabled.collect {
@@ -330,6 +384,60 @@ class PodcastViewModel(
                 _isWiFiOnlyDownloadsEnabled.value = it
             }
         }
+        viewModelScope.launch {
+            settingsManager.isSkipSilencesEnabled.collect {
+                _isSkipSilencesEnabled.value = it
+                PlaybackService.setSkipSilenceEnabled(it)
+            }
+        }
+        viewModelScope.launch {
+            settingsManager.isAutoDeletePlayedEnabled.collect {
+                _isAutoDeletePlayedEnabled.value = it
+            }
+        }
+        viewModelScope.launch {
+            settingsManager.isBackgroundSyncEnabled.collect {
+                _isBackgroundSyncEnabled.value = it
+            }
+        }
+        viewModelScope.launch {
+            settingsManager.episodeSortOrder.collect {
+                _episodeSortOrder.value = it
+            }
+        }
+        viewModelScope.launch {
+            settingsManager.episodeFilter.collect {
+                _episodeFilter.value = it
+            }
+        }
+    }
+
+    fun setSkipSilencesEnabled(enabled: Boolean) {
+        settingsManager.setSkipSilencesEnabled(enabled)
+    }
+
+    fun setAutoDeletePlayedEnabled(enabled: Boolean) {
+        settingsManager.setAutoDeletePlayedEnabled(enabled)
+    }
+
+    fun setBackgroundSyncEnabled(enabled: Boolean) {
+        settingsManager.setBackgroundSyncEnabled(enabled)
+        if (enabled) {
+            com.calmcast.podcast.work.EpisodeSyncWorker.schedule(
+                application,
+                settingsManager.isWiFiOnlyDownloadsEnabledSync()
+            )
+        } else {
+            com.calmcast.podcast.work.EpisodeSyncWorker.cancel(application)
+        }
+    }
+
+    fun setEpisodeSortOrder(order: String) {
+        settingsManager.setEpisodeSortOrder(order)
+    }
+
+    fun setEpisodeFilter(filter: String) {
+        settingsManager.setEpisodeFilter(filter)
     }
 
     private fun restoreState() {
@@ -343,6 +451,19 @@ class PodcastViewModel(
             val positionMs = snapshot.positionMs
             val speed = snapshot.playbackSpeed
             val artworkUrl = snapshot.artworkUrl
+
+            // Don't resurrect an essentially-finished episode (a kill during the final
+            // seconds can leave a stale snapshot behind even though we clear on ENDED).
+            val durationMs = DateTimeFormatter.parseDuration(episode.duration)?.times(1000L) ?: 0L
+            if (durationMs > 0 && positionMs >= durationMs * 99 / 100) {
+                withContext(Dispatchers.IO) {
+                    try {
+                        nowPlayingStorage.clear()
+                    } catch (_: Exception) {
+                    }
+                }
+                return@launch
+            }
 
             _currentEpisode.value = episode
             _currentPosition.longValue = positionMs
@@ -404,6 +525,68 @@ class PodcastViewModel(
         override fun onPlaybackStateChanged(playbackState: Int) {
             _isPlayerReady.value = playbackState == Player.STATE_READY
             _isBuffering.value = playbackState == Player.STATE_BUFFERING
+
+            com.calmcast.podcast.util.CrashLogger.log(
+                TAG,
+                "VM.onPlaybackStateChanged state=$playbackState ep=${_currentEpisode.value?.title?.take(40)} pos=${_currentPosition.longValue}ms"
+            )
+
+            // Auto-delete played episode if setting enabled
+            if (playbackState == Player.STATE_ENDED && settingsManager.isAutoDeletePlayedEnabledSync()) {
+                _currentEpisode.value?.let { episode ->
+                    val download = _downloads.value.find { it.episode.id == episode.id }
+                    if (download != null && download.status == com.calmcast.podcast.data.download.DownloadStatus.DOWNLOADED) {
+                        com.calmcast.podcast.util.CrashLogger.log(TAG, "Auto-deleting played episode: ${episode.title}")
+                        downloadManager.deleteDownload(episode)
+                    }
+                }
+            }
+
+            // The queue outranks implicit autoplay: queueing an episode is an explicit
+            // "play this next" request, so advance regardless of the autoplay setting.
+            if (playbackState == Player.STATE_ENDED) {
+                val endedId = _currentEpisode.value?.id
+                val queue = _savedEpisodes.value
+                val nextInQueue = queue.firstOrNull { it.episodeId != endedId }
+                if (endedId != null && queue.any { it.episodeId == endedId }) {
+                    // Finished a queued episode — consume it from the queue.
+                    removeSavedEpisode(endedId)
+                }
+                if (nextInQueue != null) {
+                    // Cascade breaker: if episodes are "finishing" instantly (bad stored
+                    // position, dead audio), stop advancing instead of machine-gunning
+                    // through — and silently consuming — the entire queue.
+                    val now = System.currentTimeMillis()
+                    if (now - lastQueueAdvanceAtMs < 5000) {
+                        rapidQueueAdvances++
+                    } else {
+                        rapidQueueAdvances = 0
+                    }
+                    lastQueueAdvanceAtMs = now
+                    if (rapidQueueAdvances >= 3) {
+                        com.calmcast.podcast.util.CrashLogger.log(
+                            TAG, "Queue: halting auto-advance after $rapidQueueAdvances instant-end cycles"
+                        )
+                    } else {
+                        // If the queued episode has prior progress but an unparseable
+                        // duration, we can't run the near-end reset guard — restart from
+                        // zero rather than risk starting at the end and instantly ending.
+                        val storedPos = _playbackPositions.value[nextInQueue.episodeId]?.position ?: 0L
+                        val durationKnown = DateTimeFormatter.parseDuration(nextInQueue.duration) != null
+                        val restartFromZero = storedPos > 0 && !durationKnown
+                        com.calmcast.podcast.util.CrashLogger.log(
+                            TAG, "Queue: advancing to ${nextInQueue.episodeTitle.take(40)} restart=$restartFromZero"
+                        )
+                        playEpisode(
+                            savedEpisodeToEpisode(nextInQueue),
+                            restart = restartFromZero,
+                            context = lastAutoplayContext
+                        )
+                        return
+                    }
+                }
+            }
+
             if (playbackState == Player.STATE_ENDED && settingsManager.isAutoPlayNextEpisodeEnabledSync()) {
                 var handled = false
                 when (lastAutoplayContext) {
@@ -420,7 +603,7 @@ class PodcastViewModel(
                     AutoplayContext.DOWNLOADS -> {
                         val downloadsOrdered = _downloads.value
                             .filter { download ->
-                                download.status.name != "DELETED" &&
+                                download.status != com.calmcast.podcast.data.download.DownloadStatus.DELETED &&
                                         download.episode.id.isNotBlank() &&
                                         download.episode.title.isNotBlank() &&
                                         download.episode.audioUrl.isNotBlank()
@@ -441,9 +624,77 @@ class PodcastViewModel(
                 }
             }
 
-            if (playbackState == Player.STATE_IDLE || playbackState == Player.STATE_ENDED) {
+            if (playbackState == Player.STATE_ENDED) {
+                // Episode finished naturally (and autoplay didn't take over).
                 _currentEpisode.value = null
                 stopPositionUpdates()
+                // Drop the persisted now-playing snapshot, or the next app launch
+                // restores the finished episode into the Continue Listening strip.
+                viewModelScope.launch(Dispatchers.IO) {
+                    try {
+                        nowPlayingStorage.clear()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error clearing now-playing snapshot", e)
+                    }
+                }
+            } else if (playbackState == Player.STATE_IDLE) {
+                // IDLE here means an error or stop — keep the episode so the player bar
+                // survives and the user can hit play to re-prepare and resume.
+                stopPositionUpdates()
+            }
+        }
+
+        @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+        override fun onMetadata(metadata: Metadata) {
+            // ID3v2 CHAP frames arrive here as the player decodes the audio.
+            // Wrapped defensively so malformed metadata can never crash playback.
+            val newChapters = mutableListOf<com.calmcast.podcast.data.Chapter>()
+            try {
+                for (i in 0 until metadata.length()) {
+                    val entry = metadata.get(i)
+                    if (entry is ChapterFrame) {
+                        var title = ""
+                        var imageUrl: String? = null
+                        var link: String? = null
+                        for (j in 0 until entry.subFrameCount) {
+                            val sub = entry.getSubFrame(j)
+                            when (sub) {
+                                is TextInformationFrame -> {
+                                    if (sub.id == "TIT2" && title.isEmpty()) {
+                                        title = sub.values.firstOrNull() ?: ""
+                                    }
+                                }
+                                is UrlLinkFrame -> {
+                                    if (link == null) link = sub.url
+                                }
+                                is ApicFrame -> {
+                                    // We could decode the embedded image but skip for now
+                                }
+                            }
+                        }
+                        newChapters.add(
+                            com.calmcast.podcast.data.Chapter(
+                                title = title.ifBlank { "Chapter ${newChapters.size + 1}" },
+                                startTimeMs = entry.startTimeMs.toLong(),
+                                endTimeMs = if (entry.endTimeMs > 0) entry.endTimeMs.toLong() else null,
+                                imageUrl = imageUrl,
+                                link = link
+                            )
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error parsing chapter metadata", e)
+                return
+            }
+            if (newChapters.isNotEmpty()) {
+                val sorted = newChapters.sortedBy { it.startTimeMs }
+                // Merge with existing chapters in case more arrive in subsequent metadata events
+                val merged = (_chapters.value + sorted)
+                    .distinctBy { it.startTimeMs }
+                    .sortedBy { it.startTimeMs }
+                _chapters.value = merged
+                Log.d(TAG, "Loaded ${_chapters.value.size} chapter(s) from ID3 metadata")
             }
         }
 
@@ -561,6 +812,9 @@ class PodcastViewModel(
             mediaController = controller
             controller.addListener(playerListener)
 
+            // Apply skip silences setting (lives on the underlying ExoPlayer)
+            PlaybackService.setSkipSilenceEnabled(settingsManager.isSkipSilencesEnabledSync())
+
             if (controller.playbackState != Player.STATE_IDLE && controller.currentMediaItem != null) {
                 // Player is already alive (service running), sync UI to it
                 _currentPosition.longValue = controller.currentPosition
@@ -610,6 +864,16 @@ class PodcastViewModel(
                 _currentPosition.longValue = mediaController?.currentPosition ?: 0L
                 _duration.longValue = mediaController?.duration ?: 0L
 
+                // Update current chapter index based on position
+                val chs = _chapters.value
+                if (chs.isNotEmpty()) {
+                    val pos = _currentPosition.longValue
+                    val idx = chs.indexOfLast { it.startTimeMs <= pos }
+                    if (idx != _currentChapterIndex.intValue) {
+                        _currentChapterIndex.intValue = idx
+                    }
+                }
+
                 if (_currentEpisode.value != null && _currentPosition.longValue > 0) {
                     val currentTime = System.currentTimeMillis()
                     if (currentTime - lastSaveTime >= SAVE_INTERVAL_MS) {
@@ -631,7 +895,8 @@ class PodcastViewModel(
                         persistSnapshot()
                     }
                 }
-                delay(500)
+                // 1s tick: e-ink refresh is slow; faster updates just burn CPU on recomposition
+                delay(1000)
             }
         }
     }
@@ -737,7 +1002,10 @@ class PodcastViewModel(
         _metadataLoading.value = true
         _episodesLoading.value = true
         _detailError.value = null
-        viewModelScope.launch {
+        // Cancel any in-flight fetch for a different podcast — otherwise its late
+        // emission overwrites the screen with the wrong show.
+        detailFetchJob?.cancel()
+        detailFetchJob = viewModelScope.launch {
             var podcast = podcastDao.getPodcast(podcastId)
 
             if (podcast == null) {
@@ -879,8 +1147,8 @@ class PodcastViewModel(
                                             // Only auto-download if:
                                             // 1. No record exists (never attempted)
                                             // 2. Status is not DELETED (user didn't explicitly delete it)
-                                            if (existingDownload == null || existingDownload.status.name != "DELETED") {
-                                                if (existingDownload?.status?.name !in listOf("DOWNLOADING", "DOWNLOADED", "PAUSED")) {
+                                            if (existingDownload == null || existingDownload.status != com.calmcast.podcast.data.download.DownloadStatus.DELETED) {
+                                                if (existingDownload?.status !in listOf(com.calmcast.podcast.data.download.DownloadStatus.DOWNLOADING, com.calmcast.podcast.data.download.DownloadStatus.DOWNLOADED, com.calmcast.podcast.data.download.DownloadStatus.PAUSED)) {
                                                     downloadManager.startDownload(episode)
                                                 }
                                             }
@@ -919,6 +1187,14 @@ class PodcastViewModel(
         showFullPlayer: Boolean = true
     ) {
         lastAutoplayContext = context
+
+        // A user-initiated play supersedes any in-flight network recovery
+        recoveryJob?.cancel()
+        recoveryJob = null
+
+        // Clear chapters from previous episode; new ones arrive via onMetadata
+        _chapters.value = emptyList()
+        _currentChapterIndex.intValue = -1
 
         viewModelScope.launch {
             if (_currentEpisode.value != null && _currentPosition.longValue > 0) {
@@ -986,12 +1262,12 @@ class PodcastViewModel(
 
             mediaController?.setMediaItem(mediaItem, lastPosition)
             mediaController?.prepare()
+            applyPlaybackSpeed(_playbackSpeed.value)
 
             if (autoPlay) {
                 mediaController?.play()
-                if (settingsManager.isSleepTimerEnabledSync() && settingsManager.getSleepTimerMinutesSync() > 0) {
-                    startSleepTimer()
-                }
+                // Sleep timer now only runs when the user explicitly starts it from the
+                // player (it no longer silently auto-applies a 30-min pause to every episode).
             } else {
                 mediaController?.pause()
             }
@@ -999,6 +1275,7 @@ class PodcastViewModel(
             _currentEpisode.value = episodeToPlay
             _showFullPlayer.value = showFullPlayer
             persistSnapshot()
+            recordListenHistory(episode)
         }
     }
 
@@ -1006,6 +1283,18 @@ class PodcastViewModel(
         if (_isPlaying.value) {
             mediaController?.pause()
         } else {
+            val controller = mediaController
+            val ep = _currentEpisode.value
+            if (controller != null && ep != null &&
+                (controller.playbackState == Player.STATE_IDLE || controller.currentMediaItem == null)
+            ) {
+                // Player died (network error or process restart). play() alone cannot leave
+                // STATE_IDLE — it must be re-prepared, or the button spins forever.
+                com.calmcast.podcast.util.CrashLogger.log(
+                    TAG, "togglePlayPause: player IDLE, re-preparing at ${_currentPosition.longValue}ms"
+                )
+                preparePlayerForRestoredItem(ep, _currentPosition.longValue)
+            }
             mediaController?.play()
         }
         if (!_isPlaying.value && _currentEpisode.value != null && _currentPosition.longValue > 0) {
@@ -1048,6 +1337,35 @@ class PodcastViewModel(
         saveCurrentPosition()
     }
 
+    fun seekToChapter(index: Int) {
+        val chs = _chapters.value
+        if (index < 0 || index >= chs.size) return
+        seekTo(chs[index].startTimeMs)
+        _currentChapterIndex.intValue = index
+    }
+
+    fun nextChapter() {
+        val chs = _chapters.value
+        if (chs.isEmpty()) return
+        val pos = _currentPosition.longValue
+        val nextIdx = chs.indexOfFirst { it.startTimeMs > pos }
+        if (nextIdx >= 0) seekToChapter(nextIdx)
+    }
+
+    fun previousChapter() {
+        val chs = _chapters.value
+        if (chs.isEmpty()) return
+        val pos = _currentPosition.longValue
+        // Go to previous chapter (or restart current if more than 3s in)
+        val currentIdx = chs.indexOfLast { it.startTimeMs <= pos }
+        val targetIdx = when {
+            currentIdx < 0 -> 0
+            pos - chs[currentIdx].startTimeMs > 3000L -> currentIdx
+            else -> (currentIdx - 1).coerceAtLeast(0)
+        }
+        seekToChapter(targetIdx)
+    }
+
     fun showFullPlayer() {
         _showFullPlayer.value = true
     }
@@ -1076,11 +1394,54 @@ class PodcastViewModel(
         downloadManager.deleteDownload(episode)
     }
 
+    /**
+     * Disk usage of downloads, grouped per podcast, largest first. Includes PAUSED
+     * partials — they hold real bytes on disk and would otherwise be invisible.
+     */
+    fun computeStorageUsage(): List<PodcastStorageUsage> =
+        _downloads.value
+            .filter {
+                it.status == com.calmcast.podcast.data.download.DownloadStatus.DOWNLOADED ||
+                        it.status == com.calmcast.podcast.data.download.DownloadStatus.PAUSED
+            }
+            .groupBy { it.episode.podcastId }
+            .map { (podcastId, group) ->
+                PodcastStorageUsage(
+                    podcastId = podcastId,
+                    podcastTitle = group.first().episode.podcastTitle.ifBlank { "Unknown podcast" },
+                    episodeCount = group.size,
+                    totalBytes = group.sumOf { d ->
+                        if (d.downloadedBytes > 0) d.downloadedBytes else d.totalBytes.coerceAtLeast(0L)
+                    }
+                )
+            }
+            .sortedByDescending { it.totalBytes }
+
+    /**
+     * Deletes a podcast's downloads (completed, paused, and failed partials) from disk.
+     * The currently playing episode is skipped so we never yank audio mid-listen.
+     */
+    fun deletePodcastDownloads(podcastId: String) {
+        val playingId = _currentEpisode.value?.id
+        _downloads.value
+            .filter { d ->
+                d.episode.podcastId == podcastId &&
+                        d.episode.id != playingId &&
+                        d.status in listOf(
+                    com.calmcast.podcast.data.download.DownloadStatus.DOWNLOADED,
+                    com.calmcast.podcast.data.download.DownloadStatus.PAUSED,
+                    com.calmcast.podcast.data.download.DownloadStatus.FAILED
+                )
+            }
+            .forEach { downloadManager.deleteDownload(it.episode) }
+    }
+
     fun clearPlaybackError() {
         _playbackError.value = null
     }
 
     fun clearPodcastDetails() {
+        detailFetchJob?.cancel()
         _currentPodcastDetails.value = null
         _detailError.value = null
     }
@@ -1180,12 +1541,258 @@ class PodcastViewModel(
     }
 
 
+    private fun loadListenHistory() {
+        viewModelScope.launch {
+            try {
+                _listenHistory.value = listenHistoryDao.getAll()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error loading listen history", e)
+            }
+        }
+    }
+
+    private fun recordListenHistory(episode: Episode) {
+        viewModelScope.launch {
+            try {
+                val entry = ListenHistory(
+                    episodeId = episode.id,
+                    podcastId = episode.podcastId,
+                    podcastTitle = episode.podcastTitle,
+                    episodeTitle = episode.title,
+                    description = episode.description,
+                    publishDate = episode.publishDate,
+                    publishDateMillis = episode.publishDateMillis,
+                    duration = episode.duration,
+                    audioUrl = episode.audioUrl,
+                    downloadedPath = episode.downloadedPath,
+                    lastListenedAt = System.currentTimeMillis()
+                )
+                listenHistoryDao.insert(entry)
+                _listenHistory.value = listenHistoryDao.getAll()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error recording listen history", e)
+            }
+        }
+    }
+
+    fun removeFromHistory(episodeId: String) {
+        viewModelScope.launch {
+            try {
+                listenHistoryDao.delete(episodeId)
+                _listenHistory.value = listenHistoryDao.getAll()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error removing from history", e)
+            }
+        }
+    }
+
+    fun clearHistory() {
+        viewModelScope.launch {
+            try {
+                listenHistoryDao.clearAll()
+                _listenHistory.value = emptyList()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error clearing history", e)
+            }
+        }
+    }
+
+    private fun loadSavedEpisodes() {
+        viewModelScope.launch {
+            try {
+                _savedEpisodes.value = savedEpisodeDao.getAll()
+                _savedEpisodeIds.value = savedEpisodeDao.getAllIds().toSet()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error loading saved episodes", e)
+            }
+        }
+    }
+
+    fun toggleSaveEpisode(episode: Episode) {
+        viewModelScope.launch {
+            try {
+                if (savedEpisodeDao.isSaved(episode.id)) {
+                    savedEpisodeDao.delete(episode.id)
+                } else {
+                    savedEpisodeDao.insert(
+                        SavedEpisode(
+                            episodeId = episode.id,
+                            podcastId = episode.podcastId,
+                            podcastTitle = episode.podcastTitle,
+                            episodeTitle = episode.title,
+                            description = episode.description,
+                            publishDate = episode.publishDate,
+                            publishDateMillis = episode.publishDateMillis,
+                            duration = episode.duration,
+                            audioUrl = episode.audioUrl,
+                            downloadedPath = episode.downloadedPath,
+                            savedAt = System.currentTimeMillis()
+                        )
+                    )
+                }
+                _savedEpisodes.value = savedEpisodeDao.getAll()
+                _savedEpisodeIds.value = savedEpisodeDao.getAllIds().toSet()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error toggling saved episode", e)
+            }
+        }
+    }
+
+    fun removeSavedEpisode(episodeId: String) {
+        viewModelScope.launch {
+            try {
+                savedEpisodeDao.delete(episodeId)
+                _savedEpisodes.value = savedEpisodeDao.getAll()
+                _savedEpisodeIds.value = savedEpisodeDao.getAllIds().toSet()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error removing saved episode", e)
+            }
+        }
+    }
+
+    /**
+     * Moves a queued episode one slot up or down. Order is savedAt ASC, so a move is
+     * a swap of the two rows' savedAt values (no schema migration needed).
+     */
+    fun moveQueueItem(episodeId: String, up: Boolean) {
+        viewModelScope.launch {
+            try {
+                // Serialize mutations and work from a FRESH db read: the in-memory
+                // snapshot can be stale (concurrent remove/consume), and REPLACE-insert
+                // from a stale row would resurrect a just-deleted episode.
+                queueMutex.withLock {
+                    val list = savedEpisodeDao.getAll()
+                    val idx = list.indexOfFirst { it.episodeId == episodeId }
+                    if (idx == -1) return@withLock
+                    val swapIdx = if (up) idx - 1 else idx + 1
+                    if (swapIdx !in list.indices) return@withLock
+                    val a = list[idx]
+                    val b = list[swapIdx]
+                    var newASavedAt = b.savedAt
+                    var newBSavedAt = a.savedAt
+                    if (newASavedAt == newBSavedAt) {
+                        // Identical timestamps can't express an order — nudge one key.
+                        if (up) newASavedAt -= 1 else newASavedAt += 1
+                    }
+                    savedEpisodeDao.insert(a.copy(savedAt = newASavedAt))
+                    savedEpisodeDao.insert(b.copy(savedAt = newBSavedAt))
+                    _savedEpisodes.value = savedEpisodeDao.getAll()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error reordering queue", e)
+            }
+        }
+    }
+
+    fun isEpisodeSaved(episodeId: String): Boolean = _savedEpisodeIds.value.contains(episodeId)
+
+    fun markAsPlayed(episode: Episode) {
+        viewModelScope.launch {
+            val durationSeconds = com.calmcast.podcast.utils.DateTimeFormatter.parseDuration(episode.duration) ?: 0L
+            val positionMs = durationSeconds * 1000L
+            repository.savePlaybackPosition(episodeId = episode.id, position = positionMs)
+            val updatedPosition = PlaybackPosition(
+                episodeId = episode.id,
+                position = positionMs,
+                lastPlayed = System.currentTimeMillis()
+            )
+            _playbackPositions.value = _playbackPositions.value + (episode.id to updatedPosition)
+        }
+    }
+
+    fun markAsUnplayed(episode: Episode) {
+        viewModelScope.launch {
+            repository.savePlaybackPosition(episodeId = episode.id, position = 0L)
+            _playbackPositions.value = _playbackPositions.value - episode.id
+        }
+    }
+
+    fun exportOpml(outputStream: java.io.OutputStream) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val podcasts = subscriptionManager.getSubscriptions()
+                OpmlManager.exportToOpml(podcasts, outputStream)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error exporting OPML", e)
+            }
+        }
+    }
+
+    fun importOpml(uri: Uri, onResult: (Int) -> Unit) {
+        viewModelScope.launch {
+            try {
+                val entries = withContext(Dispatchers.IO) {
+                    OpmlManager.parseOpml(application, uri)
+                }
+                var importedCount = 0
+                val existingFeedUrls = _subscriptions.value
+                    .mapNotNull { it.feedUrl?.trim()?.trimEnd('/') }
+                    .toHashSet()
+                for (entry in entries) {
+                    if (entry.feedUrl.isNotBlank()) {
+                        // Skip feeds we're already subscribed to (search-added shows have
+                        // different ids than RSS-added ones, so compare by feed URL).
+                        if (entry.feedUrl.trim().trimEnd('/') in existingFeedUrls) continue
+                        try {
+                            val result = repository.subscribeToRSSUrl(entry.feedUrl)
+                            if (result.isSuccess) {
+                                val podcast = result.getOrNull()
+                                if (podcast != null && !_subscriptions.value.any { it.id == podcast.id }) {
+                                    _subscriptions.value = (_subscriptions.value + podcast).sortedBy { it.title }
+                                }
+                                importedCount++
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to import ${entry.feedUrl}", e)
+                        }
+                    }
+                }
+                onResult(importedCount)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error importing OPML", e)
+                onResult(0)
+            }
+        }
+    }
+
+    fun historyEntryToEpisode(entry: ListenHistory): Episode = Episode(
+        id = entry.episodeId,
+        podcastId = entry.podcastId,
+        podcastTitle = entry.podcastTitle,
+        title = entry.episodeTitle,
+        description = entry.description,
+        publishDate = entry.publishDate,
+        publishDateMillis = entry.publishDateMillis,
+        duration = entry.duration,
+        audioUrl = entry.audioUrl,
+        downloadedPath = entry.downloadedPath
+    )
+
+    fun savedEpisodeToEpisode(saved: SavedEpisode): Episode = Episode(
+        id = saved.episodeId,
+        podcastId = saved.podcastId,
+        podcastTitle = saved.podcastTitle,
+        title = saved.episodeTitle,
+        description = saved.description,
+        publishDate = saved.publishDate,
+        publishDateMillis = saved.publishDateMillis,
+        duration = saved.duration,
+        audioUrl = saved.audioUrl,
+        downloadedPath = saved.downloadedPath
+    )
+
     private fun registerPlaybackServiceErrorCallback() {
         PlaybackService.setErrorCallback { error ->
+            com.calmcast.podcast.util.CrashLogger.logError(
+                TAG, "Error callback: ${error.errorCodeName}", error
+            )
             val message = when (error.errorCode) {
                 PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
-                PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> {
-                    _playbackError.value = PlaybackError.NetworkError("No internet connection")
+                PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+                PlaybackException.ERROR_CODE_IO_UNSPECIFIED -> {
+                    // Transient network failure (e-ink devices drop Wi-Fi in deep sleep and
+                    // take a while to reconnect). Auto-recover instead of dying.
+                    startPlaybackRecovery()
                     null
                 }
                 PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS -> "Server returned an error. Try again later."
@@ -1196,9 +1803,80 @@ class PodcastViewModel(
             }
             if (message != null) {
                 _playbackError.value = PlaybackError.GeneralError(message)
+                _isPlaying.value = false
+                _isBuffering.value = false
             }
+        }
+    }
+
+    private fun isNetworkAvailable(): Boolean {
+        return try {
+            val cm = application.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+                    as android.net.ConnectivityManager
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
+            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } catch (e: Exception) {
+            true // if we can't tell, let the player try anyway
+        }
+    }
+
+    /**
+     * After a mid-stream network failure, poll for connectivity and re-prepare the player
+     * at the last known position. Covers the Mudita's slow Wi-Fi wake (30-90s) after deep
+     * sleep. Gives up after ~2 minutes and falls back to a paused, resumable state.
+     */
+    private fun startPlaybackRecovery() {
+        val episode = _currentEpisode.value
+        if (episode == null) {
+            _playbackError.value = PlaybackError.NetworkError("No internet connection")
             _isPlaying.value = false
             _isBuffering.value = false
+            return
+        }
+        if (recoveryJob?.isActive == true) return
+
+        val resumePos = _currentPosition.longValue
+        // Only auto-resume if playback was actually in motion when the error hit
+        // (not when a cold paused restore failed to pre-buffer).
+        val shouldResume = mediaController?.playWhenReady ?: false
+        recoveryJob = viewModelScope.launch {
+            _isBuffering.value = true
+            com.calmcast.podcast.util.CrashLogger.log(TAG, "recovery: started at ${resumePos}ms resume=$shouldResume")
+            repeat(24) { attempt ->
+                delay(5000)
+                if (!isNetworkAvailable()) {
+                    com.calmcast.podcast.util.CrashLogger.log(TAG, "recovery: no network yet (attempt ${attempt + 1})")
+                    return@repeat
+                }
+                com.calmcast.podcast.util.CrashLogger.log(TAG, "recovery: network up, re-preparing (attempt ${attempt + 1})")
+                preparePlayerForRestoredItem(episode, resumePos)
+                if (shouldResume) {
+                    mediaController?.play()
+                }
+
+                // Wait up to 15s for the player to reach READY (or fail back to IDLE)
+                val deadline = System.currentTimeMillis() + 15000
+                while (System.currentTimeMillis() < deadline) {
+                    delay(500)
+                    when (mediaController?.playbackState) {
+                        Player.STATE_READY -> {
+                            com.calmcast.podcast.util.CrashLogger.log(TAG, "recovery: success")
+                            _playbackError.value = null
+                            _isBuffering.value = false
+                            return@launch
+                        }
+                        Player.STATE_IDLE -> {
+                            com.calmcast.podcast.util.CrashLogger.log(TAG, "recovery: attempt failed (back to IDLE)")
+                            return@repeat // errored again; next outer attempt
+                        }
+                        else -> { /* still buffering, keep waiting */ }
+                    }
+                }
+            }
+            com.calmcast.podcast.util.CrashLogger.log(TAG, "recovery: gave up after ~2 min")
+            _isBuffering.value = false
+            _isPlaying.value = false
+            _playbackError.value = PlaybackError.NetworkError("No internet connection")
         }
     }
 
@@ -1207,13 +1885,30 @@ class PodcastViewModel(
         mediaController?.removeListener(playerListener)
         PlaybackService.setErrorCallback(null)
         sleepTimerJob?.cancel()
-        viewModelScope.launch {
-            if (_currentEpisode.value != null && _currentPosition.longValue > 0) {
-                repository.savePlaybackPosition(
-                    episodeId = _currentEpisode.value!!.id,
-                    position = _currentPosition.longValue
-                )
-                persistSnapshot()
+        recoveryJob?.cancel()
+        // Best-effort final save. viewModelScope is already cancelled here, so we use a
+        // process-lifetime scope. Do NOT runBlocking on the main thread (causes ANR/freeze).
+        val ep = _currentEpisode.value
+        val pos = _currentPosition.longValue
+        if (ep != null && pos > 0) {
+            val speed = _playbackSpeed.value
+            val context = lastAutoplayContext.name
+            val artwork = _currentArtworkUri.value?.toString()
+            teardownScope.launch {
+                try {
+                    repository.savePlaybackPosition(episodeId = ep.id, position = pos)
+                    nowPlayingStorage.save(
+                        PodcastSnapshot(
+                            episode = ep,
+                            contextType = context,
+                            positionMs = pos,
+                            playbackSpeed = speed,
+                            artworkUrl = artwork
+                        )
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error saving state on clear", e)
+                }
             }
         }
         controllerFuture?.let {
@@ -1222,3 +1917,10 @@ class PodcastViewModel(
         positionUpdateJob?.cancel()
     }
 }
+/** Per-podcast disk usage of completed downloads, for the Settings storage manager. */
+data class PodcastStorageUsage(
+    val podcastId: String,
+    val podcastTitle: String,
+    val episodeCount: Int,
+    val totalBytes: Long
+)

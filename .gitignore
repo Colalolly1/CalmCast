@@ -97,3 +97,6 @@ private/
 confidential/
 config/secrets/
 *.hprof
+
+# adb backups hold app data
+*.ab

@@ -62,7 +62,7 @@ fun SubscriptionsScreen(
                 modifier = Modifier
                     .fillMaxSize(),
             ) {
-                itemsIndexed(podcasts) { index, podcast ->
+                itemsIndexed(podcasts, key = { _, podcast -> podcast.id }) { index, podcast ->
                     PodcastCard(podcast = podcast, onClick = { onPodcastClick(podcast) })
 
                     if (index < podcasts.size - 1) {

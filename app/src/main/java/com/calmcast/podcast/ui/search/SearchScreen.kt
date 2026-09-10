@@ -31,6 +31,7 @@ import com.calmapps.calmcast.R
 import com.calmcast.podcast.data.Podcast
 import com.calmcast.podcast.ui.common.DashedDivider
 import com.mudita.mmd.components.lazy.LazyColumnMMD
+import androidx.compose.material3.LinearProgressIndicator
 
 @Composable
 fun SearchScreen(
@@ -39,13 +40,19 @@ fun SearchScreen(
     onPodcastClick: (Podcast) -> Unit,
     isFollowed: (String) -> Boolean,
     onFollowClick: (Podcast) -> Unit,
-    removeDividers: Boolean = false
+    removeDividers: Boolean = false,
+    isLoading: Boolean = false
 ) {
     Column(
         modifier = Modifier
             .fillMaxSize()
     ) {
-        if (searchResults.isEmpty() && searchQuery.isNotBlank()) {
+        if (isLoading) {
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+        if (searchResults.isEmpty() && searchQuery.isNotBlank() && !isLoading) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()

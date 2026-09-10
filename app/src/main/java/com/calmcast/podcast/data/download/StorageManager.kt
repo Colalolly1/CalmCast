@@ -72,6 +72,21 @@ object StorageManager {
     }
 
     /**
+     * All directories a download file could live in, regardless of the CURRENT
+     * location preference. Used by deletion paths: a file downloaded under one
+     * setting must still be found after the user switches Internal/External.
+     */
+    fun getAllCandidateDirs(context: Context): List<File> {
+        val dirs = mutableListOf(context.filesDir)
+        try {
+            context.getExternalFilesDirs(null)?.filterNotNull()?.forEach { dirs.add(it) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to list external dirs: ${e.message}")
+        }
+        return dirs
+    }
+
+    /**
      * Check if external storage is available and writable.
      *
      * @param context Android context

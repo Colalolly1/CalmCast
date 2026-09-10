@@ -7,10 +7,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material3.RadioButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -53,16 +56,32 @@ fun SettingsScreen(
     isAutoPlayNextEpisodeEnabled: Boolean = false,
     onAutoPlayNextEpisodeToggle: (Boolean) -> Unit = {},
     isWiFiOnlyDownloadsEnabled: Boolean,
-    onWiFiOnlyDownloadsToggle: (Boolean) -> Unit = {}
+    onWiFiOnlyDownloadsToggle: (Boolean) -> Unit = {},
+    onExportOpml: () -> Unit = {},
+    onImportOpml: () -> Unit = {},
+    isSkipSilencesEnabled: Boolean = false,
+    onSkipSilencesToggle: (Boolean) -> Unit = {},
+    isAutoDeletePlayedEnabled: Boolean = false,
+    onAutoDeletePlayedToggle: (Boolean) -> Unit = {},
+    isBackgroundSyncEnabled: Boolean = true,
+    onBackgroundSyncToggle: (Boolean) -> Unit = {},
+    isBatteryExempt: Boolean = true,
+    onRequestBatteryExemption: () -> Unit = {},
+    storageUsage: List<PodcastStorageUsage> = emptyList(),
+    onDeletePodcastDownloads: (PodcastStorageUsage) -> Unit = {}
 ) {
     val skipOptions = listOf(5, 10, 15, 30)
     val sleepTimerOptions = listOf(5, 10, 15, 30, 45, 60)
     val downloadLocationOptions = listOf(DownloadLocation.INTERNAL, DownloadLocation.EXTERNAL)
-    val tabOptions = listOf("Player", "Downloads", "UI")
+    val tabOptions = listOf("Player", "Downloads", "UI", "Data")
     var selectedTab by remember { mutableIntStateOf(0) }
     
     // Local state to track playback speed for UI updates
     var localPlaybackSpeed by remember(playbackSpeed) { mutableFloatStateOf(playbackSpeed) }
+
+    // Two-tap confirmation for the storage manager's per-podcast delete:
+    // first tap arms the row, second tap actually deletes. No accidental wipes.
+    var pendingDeletePodcastId by remember { mutableStateOf<String?>(null) }
 
     Column(
         modifier = Modifier.fillMaxSize()
@@ -127,6 +146,56 @@ fun SettingsScreen(
                             SwitchMMD(
                                 checked = isPictureInPictureEnabled,
                                 onCheckedChange = onPictureInPictureToggle
+                            )
+                        }
+                        if (!removeHorizontalDividers) {
+                            DashedDivider(
+                                modifier = Modifier.padding(start = 16.dp),
+                                thickness = 1.dp
+                            )
+                        }
+                    }
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextMMD(
+                                text = "Skip silences",
+                                fontSize = 16.sp,
+                                modifier = Modifier.weight(1f)
+                            )
+                            SwitchMMD(
+                                checked = isSkipSilencesEnabled,
+                                onCheckedChange = onSkipSilencesToggle
+                            )
+                        }
+                        if (!removeHorizontalDividers) {
+                            DashedDivider(
+                                modifier = Modifier.padding(start = 16.dp),
+                                thickness = 1.dp
+                            )
+                        }
+                    }
+                    item {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onRequestBatteryExemption() }
+                                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 16.dp)
+                        ) {
+                            TextMMD(
+                                text = "Background playback",
+                                fontSize = 16.sp
+                            )
+                            TextMMD(
+                                text = if (isBatteryExempt)
+                                    "Protected — the system won't kill playback"
+                                else
+                                    "Tap to stop the system from killing playback when the screen is off",
+                                fontSize = 13.sp
                             )
                         }
                         if (!removeHorizontalDividers) {
@@ -252,6 +321,54 @@ fun SettingsScreen(
                 }
 
                 if (selectedTab == 1) {
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextMMD(
+                                text = "Background sync (every 6h)",
+                                fontSize = 16.sp,
+                                modifier = Modifier.weight(1f)
+                            )
+                            SwitchMMD(
+                                checked = isBackgroundSyncEnabled,
+                                onCheckedChange = onBackgroundSyncToggle
+                            )
+                        }
+                        if (!removeHorizontalDividers) {
+                            DashedDivider(
+                                modifier = Modifier.padding(start = 16.dp),
+                                thickness = 1.dp
+                            )
+                        }
+                    }
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextMMD(
+                                text = "Auto-delete after listening",
+                                fontSize = 16.sp,
+                                modifier = Modifier.weight(1f)
+                            )
+                            SwitchMMD(
+                                checked = isAutoDeletePlayedEnabled,
+                                onCheckedChange = onAutoDeletePlayedToggle
+                            )
+                        }
+                        if (!removeHorizontalDividers) {
+                            DashedDivider(
+                                modifier = Modifier.padding(start = 16.dp),
+                                thickness = 1.dp
+                            )
+                        }
+                    }
                     item {
                         Row(
                             modifier = Modifier
@@ -406,7 +523,147 @@ fun SettingsScreen(
                         }
                     }
                 }
+
+                if (selectedTab == 3) {
+                    item {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp)
+                        ) {
+                            TextMMD(
+                                text = "OPML",
+                                fontSize = 16.sp,
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                            )
+                            TextMMD(
+                                text = "Transfer subscriptions between podcast apps",
+                                fontSize = 14.sp,
+                            )
+                        }
+                    }
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onExportOpml() }
+                                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextMMD(
+                                text = "Export subscriptions",
+                                fontSize = 16.sp,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        if (!removeHorizontalDividers) {
+                            DashedDivider(
+                                modifier = Modifier.padding(start = 16.dp),
+                                thickness = 1.dp
+                            )
+                        }
+                    }
+                    item {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onImportOpml() }
+                                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextMMD(
+                                text = "Import subscriptions",
+                                fontSize = 16.sp,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        if (!removeHorizontalDividers) {
+                            DashedDivider(
+                                modifier = Modifier.padding(start = 16.dp),
+                                thickness = 1.dp
+                            )
+                        }
+                    }
+                    item {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 16.dp, end = 16.dp, top = 24.dp, bottom = 8.dp)
+                        ) {
+                            TextMMD(
+                                text = "Storage",
+                                fontSize = 16.sp,
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                            )
+                            TextMMD(
+                                text = if (storageUsage.isEmpty())
+                                    "No downloaded episodes"
+                                else
+                                    "Total: ${formatBytes(storageUsage.sumOf { it.totalBytes })} across ${storageUsage.sumOf { it.episodeCount }} episode(s)",
+                                fontSize = 14.sp
+                            )
+                        }
+                    }
+                    items(storageUsage, key = { it.podcastId }) { usage ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                TextMMD(
+                                    text = usage.podcastTitle,
+                                    fontSize = 15.sp,
+                                    maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                )
+                                TextMMD(
+                                    text = "${usage.episodeCount} episode(s) · ${formatBytes(usage.totalBytes)}",
+                                    fontSize = 13.sp
+                                )
+                            }
+                            if (pendingDeletePodcastId == usage.podcastId) {
+                                TextMMD(
+                                    text = "Tap to confirm",
+                                    fontSize = 13.sp,
+                                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                                    modifier = Modifier
+                                        .clickable {
+                                            pendingDeletePodcastId = null
+                                            onDeletePodcastDownloads(usage)
+                                        }
+                                        .padding(horizontal = 12.dp, vertical = 12.dp)
+                                )
+                            } else {
+                                androidx.compose.material3.IconButton(
+                                    onClick = { pendingDeletePodcastId = usage.podcastId }
+                                ) {
+                                    androidx.compose.material3.Icon(
+                                        imageVector = Icons.Outlined.Delete,
+                                        contentDescription = "Delete all downloads for ${usage.podcastTitle}"
+                                    )
+                                }
+                            }
+                        }
+                        if (!removeHorizontalDividers) {
+                            DashedDivider(
+                                modifier = Modifier.padding(start = 16.dp),
+                                thickness = 1.dp
+                            )
+                        }
+                    }
+                }
             }
         }
+    }
+}
+
+private fun formatBytes(bytes: Long): String {
+    return when {
+        bytes >= 1024L * 1024L * 1024L -> String.format("%.1f GB", bytes / (1024.0 * 1024.0 * 1024.0))
+        bytes >= 1024L * 1024L -> String.format("%.0f MB", bytes / (1024.0 * 1024.0))
+        bytes >= 1024L -> String.format("%.0f KB", bytes / 1024.0)
+        else -> "$bytes B"
     }
 }

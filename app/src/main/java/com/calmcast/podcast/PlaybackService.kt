@@ -24,6 +24,8 @@ sealed class PlaybackError {
 
 class PlaybackService : MediaSessionService() {
     private var mediaSession: MediaSession? = null
+    private var audioManager: android.media.AudioManager? = null
+    private var deviceCallback: android.media.AudioDeviceCallback? = null
 
     companion object {
         private const val NOTIFICATION_ID = 123
@@ -74,6 +76,12 @@ class PlaybackService : MediaSessionService() {
 
         // Handle headphone unplug and audio becoming noisy
         player.setHandleAudioBecomingNoisy(true)
+
+        // ACTION_AUDIO_BECOMING_NOISY, which the line above listens for, is only
+        // broadcast for the wired jack on some ROMs — Bluetooth earbuds could
+        // disconnect and leave the episode playing out of the phone's speaker.
+        // Watching the audio devices directly is what actually catches that.
+        registerOutputDeviceWatcher(player)
 
         // Hold a Wi-Fi + partial wake lock while playing so streaming doesn't stall
         // when the screen turns off and the device enters deep sleep (common cause of
@@ -207,7 +215,39 @@ class PlaybackService : MediaSessionService() {
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =
         mediaSession
 
+    /**
+     * Pause when the thing you were listening through goes away: Bluetooth
+     * (A2DP or headset), the wired jack, or a USB audio device.
+     */
+    private fun registerOutputDeviceWatcher(player: ExoPlayer) {
+        val manager = getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager ?: return
+        val personalOutputs = setOf(
+            android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
+            android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+            android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET,
+            android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES,
+            android.media.AudioDeviceInfo.TYPE_USB_HEADSET,
+            android.media.AudioDeviceInfo.TYPE_USB_DEVICE,
+        )
+        val callback = object : android.media.AudioDeviceCallback() {
+            override fun onAudioDevicesRemoved(removed: Array<out android.media.AudioDeviceInfo>?) {
+                val lostListening = removed?.any { it.isSink && it.type in personalOutputs } == true
+                if (!lostListening) return
+                // The callback can arrive on a binder thread; touch the player on its own.
+                android.os.Handler(mainLooper).post {
+                    if (player.isPlaying) player.pause()
+                }
+            }
+        }
+        manager.registerAudioDeviceCallback(callback, android.os.Handler(mainLooper))
+        audioManager = manager
+        deviceCallback = callback
+    }
+
     override fun onDestroy() {
+        deviceCallback?.let { audioManager?.unregisterAudioDeviceCallback(it) }
+        deviceCallback = null
+        audioManager = null
         mediaSession?.run {
             player.release()
             release()

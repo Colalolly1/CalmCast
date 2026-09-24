@@ -87,6 +87,19 @@ class PlaybackService : MediaSessionService() {
         // when the screen turns off and the device enters deep sleep (common cause of
         // playback cutting out a few minutes / ~30 min after screen-off on Wi-Fi).
         player.setWakeMode(androidx.media3.common.C.WAKE_MODE_NETWORK)
+        // A network wake mode also holds a Wi-Fi lock, which keeps the radio at
+        // full power for the whole episode. That is only worth paying for a
+        // stream; a downloaded file needs the CPU awake and nothing more.
+        player.addListener(object : Player.Listener {
+            override fun onMediaItemTransition(mediaItem: androidx.media3.common.MediaItem?, reason: Int) {
+                val scheme = mediaItem?.localConfiguration?.uri?.scheme?.lowercase()
+                val streaming = scheme == "http" || scheme == "https"
+                player.setWakeMode(
+                    if (streaming) androidx.media3.common.C.WAKE_MODE_NETWORK
+                    else androidx.media3.common.C.WAKE_MODE_LOCAL
+                )
+            }
+        })
 
         player.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {

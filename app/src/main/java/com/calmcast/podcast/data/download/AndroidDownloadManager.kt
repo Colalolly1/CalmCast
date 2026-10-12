@@ -3,21 +3,50 @@ package com.calmcast.podcast.data.download
 import android.content.Context
 import android.net.Uri
 import android.util.Log
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.workDataOf
 import com.calmcast.podcast.data.PodcastRepository.Episode
 import com.calmcast.podcast.data.SettingsManager
+import com.calmcast.podcast.util.NetworkUtil
+import com.calmcast.podcast.work.EpisodeDownloadWorker
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
+/** How one download attempt ended; EpisodeDownloadWorker turns this into a WorkManager result. */
+enum class DownloadOutcome { DONE, RETRY, FAILED, STOPPED }
+
+/**
+ * Each download runs as a unique WorkManager job per episode (see EpisodeDownloadWorker),
+ * so it survives the app's screen going away and retries with backoff on patchy signal.
+ * This class enqueues those jobs and does the actual transfer when a job runs.
+ */
 class AndroidDownloadManager(
     private val context: Context,
     private val client: OkHttpClient,
@@ -27,230 +56,320 @@ class AndroidDownloadManager(
 
     companion object {
         private const val TAG = "AndroidDownloadManager"
+
+        fun workName(episodeId: String) = "download_$episodeId"
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val workManager by lazy { WorkManager.getInstance(context) }
 
-    // Mutated from both the main thread (clicks) and IO coroutines — must be concurrent.
-    private val activeDownloads = java.util.concurrent.ConcurrentHashMap<String, Job>()
-    private val activeCalls = java.util.concurrent.ConcurrentHashMap<String, Call>()
-    private val pausedDownloads: MutableSet<String> =
-        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+    private val activeCalls = ConcurrentHashMap<String, Call>()
+    // Episodes the user paused or removed, so a job that is unwinding doesn't treat it as a network drop.
+    private val stopRequested: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    // One writer per episode file: a replaced or stopped job finishes before the next one starts.
+    private val fileLocks = ConcurrentHashMap<String, Mutex>()
+
+    private fun lockFor(episodeId: String): Mutex = fileLocks.getOrPut(episodeId) { Mutex() }
 
     override val downloads: Flow<List<Download>> = downloadDao.getAll()
 
     override fun startDownload(episode: Episode): Long {
-        val downloadId = episode.audioUrl.hashCode().toLong()
-        val episodeId = episode.id
+        scope.launch { enqueueDownload(episode, userInitiated = true) }
+        return episode.audioUrl.hashCode().toLong()
+    }
 
-        // Double-tap / sync race guard: two jobs writing the same file corrupt the audio.
-        if (activeDownloads.containsKey(episodeId)) {
-            Log.d(TAG, "Download already active for ${episode.title}, ignoring duplicate start")
-            return downloadId
-        }
-        val baseDir: File
+    override fun startAutoDownload(episode: Episode) {
+        scope.launch { enqueueDownload(episode, userInitiated = false) }
+    }
+
+    /**
+     * A tap runs on any network and replaces whatever job was waiting. Automatic downloads
+     * wait for Wi-Fi when the Wi-Fi-only setting is on, and leave a pending job alone.
+     */
+    suspend fun enqueueDownload(episode: Episode, userInitiated: Boolean): Unit = withContext(Dispatchers.IO) {
         try {
-            baseDir = StorageManager.getDownloadBaseDir(context, settingsManager)
+            if (!userInitiated && hasPendingJob(episode.id)) return@withContext
+            stopRequested.remove(episode.id)
+
+            val wifiOnly = !userInitiated && settingsManager.isWiFiOnlyDownloadsEnabledSync()
+            val canStartNow = !wifiOnly || NetworkUtil.isConnectedToWiFi(context)
+            val existing = downloadDao.getByEpisodeId(episode.id)
+            downloadDao.insert(
+                Download(
+                    id = episode.id,
+                    episode = episode,
+                    // Waiting for Wi-Fi shows as paused; the job flips it to downloading when it starts.
+                    status = if (canStartNow) DownloadStatus.DOWNLOADING else DownloadStatus.PAUSED,
+                    progress = existing?.progress?.coerceAtLeast(0f) ?: 0f,
+                    downloadedBytes = existing?.downloadedBytes ?: 0L,
+                    totalBytes = existing?.totalBytes ?: -1L
+                )
+            )
+
+            val request = OneTimeWorkRequestBuilder<EpisodeDownloadWorker>()
+                .setInputData(workDataOf(EpisodeDownloadWorker.KEY_EPISODE_ID to episode.id))
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(if (wifiOnly) NetworkType.UNMETERED else NetworkType.CONNECTED)
+                        .build()
+                )
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                .build()
+            workManager.enqueueUniqueWork(
+                workName(episode.id),
+                if (userInitiated) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP,
+                request
+            ).result.get()
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not queue download for ${episode.title}", e)
+        }
+        Unit
+    }
+
+    private fun hasPendingJob(episodeId: String): Boolean =
+        workManager.getWorkInfosForUniqueWork(workName(episodeId)).get().any { !it.state.isFinished }
+
+    /**
+     * Rows left DOWNLOADING by a process that was killed have no job behind them any more.
+     * Called on app start so they show as paused (resumable) instead of spinning forever.
+     */
+    suspend fun pauseOrphanedDownloads(): Unit = withContext(Dispatchers.IO) {
+        val stuck = downloadDao.getAll().first().filter { it.status == DownloadStatus.DOWNLOADING }
+        for (download in stuck) {
+            try {
+                if (hasPendingJob(download.id)) continue
+                lockFor(download.id).withLock {
+                    val current = downloadDao.getByEpisodeId(download.id) ?: return@withLock
+                    if (current.status == DownloadStatus.DOWNLOADING) {
+                        downloadDao.insert(current.copy(status = DownloadStatus.PAUSED))
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not check download ${download.id}: ${e.message}")
+            }
+        }
+    }
+
+    /** Called by EpisodeDownloadWorker. Resumes from any partial file already on disk. */
+    suspend fun runDownload(episodeId: String, finalAttempt: Boolean): DownloadOutcome =
+        withContext(Dispatchers.IO) {
+            lockFor(episodeId).withLock { downloadLocked(episodeId, finalAttempt) }
+        }
+
+    private suspend fun downloadLocked(episodeId: String, finalAttempt: Boolean): DownloadOutcome {
+        val row = downloadDao.getByEpisodeId(episodeId) ?: return DownloadOutcome.DONE
+        // Removed by the user before this job got to run.
+        if (row.status == DownloadStatus.DELETED || row.status == DownloadStatus.CANCELED) {
+            return DownloadOutcome.DONE
+        }
+        val episode = row.episode
+        if (row.status == DownloadStatus.DOWNLOADED && fileExists(row.downloadUri)) {
+            return DownloadOutcome.DONE
+        }
+
+        val baseDir = try {
+            StorageManager.getDownloadBaseDir(context, settingsManager)
         } catch (e: StorageUnavailableException) {
             Log.w(TAG, "External storage unavailable for episode: ${episode.title}")
-            scope.launch {
-                val download = Download(episodeId, episode, DownloadStatus.STORAGE_UNAVAILABLE, 0f)
-                downloadDao.insert(download)
-            }
-            return downloadId
+            downloadDao.insert(row.copy(status = DownloadStatus.STORAGE_UNAVAILABLE, progress = 0f))
+            return DownloadOutcome.FAILED
         }
         val file = File(baseDir, "${episode.id}.mp3")
+        val bytesAlready = if (file.exists()) file.length() else 0L
+        downloadDao.insert(row.copy(status = DownloadStatus.DOWNLOADING, downloadUri = null))
 
-        val download = Download(episodeId, episode, DownloadStatus.DOWNLOADING, 0f)
-
-        val job = scope.launch {
-            downloadDao.insert(download)
-            try {
-                val attemptResume = file.exists() && file.length() > 0
-                val bytesAlready = if (attemptResume) file.length() else 0L
-
-                val requestBuilder = Request.Builder().url(episode.audioUrl)
-                if (bytesAlready > 0) {
-                    requestBuilder.addHeader("Range", "bytes=$bytesAlready-")
+        var call: Call? = null
+        val outcome = try {
+            val requestBuilder = Request.Builder().url(episode.audioUrl)
+            if (bytesAlready > 0) {
+                requestBuilder.addHeader("Range", "bytes=$bytesAlready-")
+            }
+            val newCall = client.newCall(requestBuilder.build())
+            call = newCall
+            activeCalls[episodeId] = newCall
+            coroutineScope {
+                // A blocked socket read only notices the job being stopped once the call is cancelled.
+                val watcher = launch(start = CoroutineStart.UNDISPATCHED) {
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        newCall.cancel()
+                    }
                 }
+                try {
+                    fetch(newCall, row, file, bytesAlready)
+                } finally {
+                    watcher.cancel()
+                }
+            }
+        } catch (e: IOException) {
+            // Signal dropped or the call was cancelled. The partial file stays for the next attempt.
+            Log.w(TAG, "Download interrupted for ${episode.title}: ${e.message}")
+            saveProgress(episodeId, file)
+            currentCoroutineContext().ensureActive()
+            if (stopRequested.contains(episodeId)) DownloadOutcome.STOPPED else DownloadOutcome.RETRY
+        } catch (e: CancellationException) {
+            saveProgress(episodeId, file)
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception during download for episode ${episode.title}: ${e.message}", e)
+            DownloadOutcome.FAILED
+        } finally {
+            call?.let { activeCalls.remove(episodeId, it) }
+        }
 
-                val call = client.newCall(requestBuilder.build())
-                activeCalls[episodeId] = call
+        if (outcome == DownloadOutcome.FAILED || (outcome == DownloadOutcome.RETRY && finalAttempt)) {
+            val current = downloadDao.getByEpisodeId(episodeId)
+            if (current != null && current.status == DownloadStatus.DOWNLOADING) {
+                downloadDao.insert(current.copy(status = DownloadStatus.FAILED, progress = 0f))
+            }
+            return DownloadOutcome.FAILED
+        }
+        return outcome
+    }
 
-                val response = call.execute()
-                if (response.isSuccessful) {
-                    val code = response.code
-                    val body = response.body
+    private suspend fun fetch(call: Call, row: Download, file: File, bytesAlready: Long): DownloadOutcome {
+        call.execute().use { response ->
+            if (response.code == 416) {
+                // The partial no longer lines up with the server's file; start over next attempt.
+                Log.w(TAG, "Range not satisfiable for episode: ${row.episode.title}. Retrying from scratch.")
+                file.delete()
+                return DownloadOutcome.RETRY
+            }
+            if (!response.isSuccessful) {
+                Log.w(TAG, "Download failed with status ${response.code} for episode: ${row.episode.title}")
+                val temporary = response.code >= 500 || response.code == 408 || response.code == 429
+                return if (temporary) DownloadOutcome.RETRY else DownloadOutcome.FAILED
+            }
+            val body = response.body ?: return DownloadOutcome.RETRY
 
-                    if (body != null) {
-                        val isResume = code == 206
+            val isResume = response.code == 206
+            val startBytes = if (isResume) bytesAlready else 0L
+            val serverBytes = body.contentLength()
+            val totalBytes = if (serverBytes != -1L) startBytes + serverBytes else -1L
+            var bytesCopied = startBytes
 
-                        val finalBytesAlready = if (isResume) bytesAlready else 0L
-                        val appendMode = isResume
+            val download = row.copy(status = DownloadStatus.DOWNLOADING, downloadUri = null)
+            downloadDao.insert(download.copy(
+                progress = fraction(bytesCopied, totalBytes),
+                downloadedBytes = bytesCopied,
+                totalBytes = totalBytes
+            ))
 
-                        val serverBytes = body.contentLength()
-                        val totalBytes = if (serverBytes != -1L) finalBytesAlready + serverBytes else -1L
+            body.byteStream().use { input ->
+                FileOutputStream(file, isResume).use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    var read = input.read(buffer)
+                    var lastDbUpdateTime = System.currentTimeMillis()
 
-                        var bytesCopied = finalBytesAlready
+                    while (read >= 0) {
+                        currentCoroutineContext().ensureActive()
+                        output.write(buffer, 0, read)
+                        bytesCopied += read
 
-                        try {
-                            body.byteStream().use { input ->
-                                FileOutputStream(file, appendMode).use { output ->
-                                    val buffer = ByteArray(64 * 1024)
-                                    var read = input.read(buffer)
-                                    var lastDbUpdateTime = System.currentTimeMillis()
-
-                                    while (read >= 0) {
-                                        if (pausedDownloads.contains(episodeId)) {
-                                            downloadDao.insert(download.copy(
-                                                status = DownloadStatus.PAUSED,
-                                                progress = if (totalBytes > 0) bytesCopied.toFloat() / totalBytes.toFloat() else 0f,
-                                                downloadedBytes = bytesCopied,
-                                                totalBytes = totalBytes
-                                            ))
-                                            return@launch
-                                        }
-
-                                        output.write(buffer, 0, read)
-                                        bytesCopied += read
-
-                                        val progress = if (totalBytes > 0) {
-                                            bytesCopied.toFloat() / totalBytes.toFloat()
-                                        } else {
-                                            -1f
-                                        }
-
-                                        // Each insert makes Room re-emit the full download list and
-                                        // recompose observers — 5s is plenty for an e-ink progress bar.
-                                        val currentTime = System.currentTimeMillis()
-                                        if (currentTime - lastDbUpdateTime >= 5000) {
-                                            downloadDao.insert(download.copy(
-                                                status = DownloadStatus.DOWNLOADING,
-                                                progress = progress,
-                                                downloadedBytes = bytesCopied,
-                                                totalBytes = totalBytes
-                                            ))
-                                            lastDbUpdateTime = currentTime
-                                        }
-                                        read = input.read(buffer)
-                                    }
-                                }
-                            }
-                        } catch (e: IOException) {
-                            // Keep the partial when paused (resume needs it); otherwise delete
-                            // so failed partials don't silently accumulate on disk.
-                            // (Condition was previously inverted — `!file.exists()` — making
-                            // this cleanup dead code.)
-                            if (!pausedDownloads.contains(episodeId) && file.exists()) {
-                                file.delete()
-                            }
-                            throw e
-                        }
-
-                        if (totalBytes != -1L && bytesCopied < totalBytes) {
-                            if (pausedDownloads.contains(episodeId)) {
-                                Log.d(TAG, "Download paused for ${episode.title}")
-                                downloadDao.insert(download.copy(
-                                    status = DownloadStatus.PAUSED,
-                                    progress = bytesCopied.toFloat() / totalBytes.toFloat(),
-                                    downloadedBytes = bytesCopied,
-                                    totalBytes = totalBytes
-                                ))
-                            } else {
-                                Log.w(TAG, "Download incomplete for ${episode.title}: $bytesCopied / $totalBytes bytes")
-                                downloadDao.insert(download.copy(status = DownloadStatus.FAILED, progress = 0f))
-                            }
-                        } else {
-                            val fileUri = Uri.fromFile(file).toString()
+                        // Each insert makes Room re-emit the full download list and
+                        // recompose observers — 5s is plenty for an e-ink progress bar.
+                        val currentTime = System.currentTimeMillis()
+                        if (currentTime - lastDbUpdateTime >= 5000) {
                             downloadDao.insert(download.copy(
-                                status = DownloadStatus.DOWNLOADED,
-                                progress = 1f,
-                                downloadUri = fileUri,
+                                progress = fraction(bytesCopied, totalBytes),
                                 downloadedBytes = bytesCopied,
                                 totalBytes = totalBytes
                             ))
+                            lastDbUpdateTime = currentTime
                         }
-                    } else {
-                        Log.w(TAG, "No response body for episode: ${episode.title}")
-                        downloadDao.insert(download.copy(status = DownloadStatus.FAILED, progress = 0f))
+                        read = input.read(buffer)
                     }
-                } else if (response.code == 416) {
-                    Log.w(TAG, "Range not satisfiable for episode: ${episode.title}. Retrying from scratch.")
-                    file.delete()
-                    downloadDao.insert(download.copy(status = DownloadStatus.FAILED, progress = 0f))
-                } else {
-                    Log.w(TAG, "Download failed with status ${response.code} for episode: ${episode.title}")
-                    downloadDao.insert(download.copy(status = DownloadStatus.FAILED, progress = 0f))
-                }
-            } catch (e: Exception) {
-                val isCancelled = (e is IOException && e.message == "Canceled") ||
-                        (e is java.net.SocketException && e.message?.contains("closed") == true)
-
-                if (pausedDownloads.contains(episodeId) || isCancelled) {
-                    Log.d(TAG, "Download paused (exception caught) for ${episode.title}")
-                    val currentBytes = if (file.exists()) file.length() else 0L
-                    downloadDao.insert(download.copy(
-                        status = DownloadStatus.PAUSED,
-                        downloadedBytes = currentBytes
-                    ))
-                } else {
-                    Log.e(TAG, "Exception during download for episode ${episode.title}: ${e.message}", e)
-                    downloadDao.insert(download.copy(status = DownloadStatus.FAILED, progress = 0f))
-                }
-            } finally {
-                activeDownloads.remove(episodeId)
-                activeCalls.remove(episodeId)
-                if (!pausedDownloads.contains(episodeId)) {
-                    pausedDownloads.remove(episodeId)
                 }
             }
-        }
 
-        activeDownloads[episodeId] = job
-        return downloadId
+            if (totalBytes != -1L && bytesCopied < totalBytes) {
+                Log.w(TAG, "Download incomplete for ${row.episode.title}: $bytesCopied / $totalBytes bytes")
+                downloadDao.insert(download.copy(
+                    progress = fraction(bytesCopied, totalBytes),
+                    downloadedBytes = bytesCopied,
+                    totalBytes = totalBytes
+                ))
+                return DownloadOutcome.RETRY
+            }
+
+            downloadDao.insert(download.copy(
+                status = DownloadStatus.DOWNLOADED,
+                progress = 1f,
+                downloadUri = Uri.fromFile(file).toString(),
+                downloadedBytes = bytesCopied,
+                totalBytes = totalBytes
+            ))
+            return DownloadOutcome.DONE
+        }
+    }
+
+    private fun fraction(bytes: Long, total: Long): Float =
+        if (total > 0) bytes.toFloat() / total.toFloat() else -1f
+
+    private fun fileExists(downloadUri: String?): Boolean {
+        val path = downloadUri?.let { Uri.parse(it).path } ?: return false
+        return File(path).exists()
+    }
+
+    // Records how far a stopped download got, leaving the status to whoever stopped it.
+    private suspend fun saveProgress(episodeId: String, file: File): Unit = withContext(NonCancellable) {
+        val current = downloadDao.getByEpisodeId(episodeId) ?: return@withContext
+        if (current.status != DownloadStatus.DOWNLOADING) return@withContext
+        val bytes = if (file.exists()) file.length() else 0L
+        downloadDao.insert(current.copy(
+            progress = fraction(bytes, current.totalBytes).coerceAtLeast(0f),
+            downloadedBytes = bytes
+        ))
     }
 
     override fun cancelDownload(id: Long) {
-        val episodeId = activeDownloads.keys.find { it.hashCode().toLong() == id }
+        val episodeId = activeCalls.keys.find { it.hashCode().toLong() == id }
         if (episodeId != null) {
             cancelDownload(episodeId)
         }
     }
 
     override fun cancelDownload(episodeId: String) {
-        pausedDownloads.remove(episodeId)
-        activeCalls[episodeId]?.cancel()
-        activeDownloads[episodeId]?.cancel()
+        stopJob(episodeId)
         scope.launch {
-            // File/storage I/O off the caller thread — this is invoked from onClick.
-            val download = downloadDao.getByEpisodeId(episodeId)
-            deleteDownloadFiles(episodeId, download?.episode?.title ?: "", download?.downloadUri)
-            if (download != null) {
-                downloadDao.insert(download.copy(status = DownloadStatus.DELETED, progress = 0f, downloadUri = null, downloadedBytes = 0L, totalBytes = -1L))
+            // Wait for a running job to close the file before deleting it.
+            lockFor(episodeId).withLock {
+                val download = downloadDao.getByEpisodeId(episodeId)
+                deleteDownloadFiles(episodeId, download?.episode?.title ?: "", download?.downloadUri)
+                if (download != null) {
+                    downloadDao.insert(download.copy(status = DownloadStatus.DELETED, progress = 0f, downloadUri = null, downloadedBytes = 0L, totalBytes = -1L))
+                }
             }
         }
     }
 
     override fun pauseDownload(episodeId: String) {
-        pausedDownloads.add(episodeId)
-        // Optimistically update DB
+        stopJob(episodeId)
         scope.launch {
-            val download = downloadDao.getByEpisodeId(episodeId)
-            if (download != null && download.status == DownloadStatus.DOWNLOADING) {
-                downloadDao.insert(download.copy(status = DownloadStatus.PAUSED))
+            // Wait for a running job to record its progress, then mark it paused.
+            lockFor(episodeId).withLock {
+                val download = downloadDao.getByEpisodeId(episodeId)
+                if (download != null && download.status == DownloadStatus.DOWNLOADING) {
+                    downloadDao.insert(download.copy(status = DownloadStatus.PAUSED))
+                }
             }
         }
-        // Cancel the call to stop network traffic immediately
+    }
+
+    private fun stopJob(episodeId: String) {
+        stopRequested.add(episodeId)
+        workManager.cancelUniqueWork(workName(episodeId))
+        // Cancel the call too, to stop network traffic straight away.
         activeCalls[episodeId]?.cancel()
     }
 
     override fun resumeDownload(episodeId: String) {
-        pausedDownloads.remove(episodeId)
         scope.launch {
             val download = downloadDao.getByEpisodeId(episodeId)
-            if (download != null && download.status == DownloadStatus.PAUSED) {
-                // Restart the download - it will detect the partial file and resume from offset
-                startDownload(download.episode)
+            if (download != null && download.status != DownloadStatus.DOWNLOADED) {
+                // The job picks up the partial file and resumes from its length.
+                enqueueDownload(download.episode, userInitiated = true)
             }
         }
     }
@@ -263,13 +382,16 @@ class AndroidDownloadManager(
     }
 
     override fun deleteDownload(episode: Episode) {
+        stopJob(episode.id)
         scope.launch {
             // File/storage I/O off the caller thread — this is invoked from onClick and
             // from the player's STATE_ENDED callback on the main thread.
-            val download = downloadDao.getByEpisodeId(episode.id)
-            deleteDownloadFiles(episode.id, episode.title, download?.downloadUri)
-            if (download != null) {
-                downloadDao.insert(download.copy(status = DownloadStatus.DELETED, downloadUri = null, progress = 0f, downloadedBytes = 0L, totalBytes = -1L))
+            lockFor(episode.id).withLock {
+                val download = downloadDao.getByEpisodeId(episode.id)
+                deleteDownloadFiles(episode.id, episode.title, download?.downloadUri)
+                if (download != null) {
+                    downloadDao.insert(download.copy(status = DownloadStatus.DELETED, downloadUri = null, progress = 0f, downloadedBytes = 0L, totalBytes = -1L))
+                }
             }
         }
     }

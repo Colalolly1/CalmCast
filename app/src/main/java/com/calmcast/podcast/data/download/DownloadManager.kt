@@ -6,6 +6,8 @@ import kotlinx.coroutines.flow.Flow
 interface DownloadManager {
     val downloads: Flow<List<Download>>
     fun startDownload(episode: PodcastRepository.Episode): Long
+    /** Like startDownload, but honours the Wi-Fi-only setting and leaves a pending job alone. */
+    fun startAutoDownload(episode: PodcastRepository.Episode)
     fun cancelDownload(id: Long)
     fun cancelDownload(episodeId: String)
     fun pauseDownload(episodeId: String)

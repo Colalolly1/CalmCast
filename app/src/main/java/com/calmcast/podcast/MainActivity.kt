@@ -38,6 +38,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -229,15 +230,22 @@ fun CalmCastApp(pipStateHolder: androidx.compose.runtime.MutableState<Boolean>, 
     LaunchedEffect(Unit) {
         snapshotFlow { viewModel.playbackError.value }
             .collect { error ->
-                if (error != null) {
-                    val result = snackbarHostState.showSnackbar(
-                        message = "No internet connection. Go to Downloads to play offline episodes.",
-                        actionLabel = "Downloads"
-                    )
-                    if (result == com.mudita.mmd.components.snackbar.SnackbarResultMMD.ActionPerformed) {
-                        navController.navigate("downloads")
+                when (error) {
+                    is com.calmcast.podcast.PlaybackError.NetworkError -> {
+                        val result = snackbarHostState.showSnackbar(
+                            message = "${error.message}. Go to Downloads to play offline episodes.",
+                            actionLabel = "Downloads"
+                        )
+                        if (result == com.mudita.mmd.components.snackbar.SnackbarResultMMD.ActionPerformed) {
+                            navController.navigate("downloads")
+                        }
+                        viewModel.clearPlaybackError()
                     }
-                    viewModel.clearPlaybackError()
+                    is com.calmcast.podcast.PlaybackError.GeneralError -> {
+                        snackbarHostState.showSnackbar(error.message)
+                        viewModel.clearPlaybackError()
+                    }
+                    null -> {}
                 }
             }
     }
@@ -620,6 +628,9 @@ fun CalmCastApp(pipStateHolder: androidx.compose.runtime.MutableState<Boolean>, 
                                 onResumeClick = { episode: Episode ->
                                     viewModel.resumeDownload(episode.id)
                                 },
+                                onRetryClick = { episode: Episode ->
+                                    viewModel.retryDownload(episode)
+                                },
                                 onRefreshClick = {
                                     viewModel.refreshPodcastEpisodes(podcast.id)
                                 },
@@ -719,6 +730,9 @@ fun CalmCastApp(pipStateHolder: androidx.compose.runtime.MutableState<Boolean>, 
                             },
                             onResumeClick = { episode ->
                                 viewModel.resumeDownload(episode.id)
+                            },
+                            onRetryClick = { episode ->
+                                viewModel.retryDownload(episode)
                             },
                             removeDividers = viewModel.removeHorizontalDividers.value
                         )
@@ -862,6 +876,14 @@ private fun FullPlayerOverlay(viewModel: PodcastViewModel) {
     BackHandler {
         viewModel.minimizePlayer()
     }
+    // The player shows whole minutes; reading through these means the 1s position and
+    // sleep-timer ticks only recompose it when the shown minute changes.
+    val shownPosition by remember(viewModel) {
+        derivedStateOf { viewModel.currentPosition.value / 60_000L * 60_000L }
+    }
+    val shownSleepSeconds by remember(viewModel) {
+        derivedStateOf { (viewModel.sleepTimerRemainingSeconds.value + 59) / 60 * 60 }
+    }
     FullPlayerScreen(
         episode = viewModel.currentEpisode.value,
         artworkUrl = viewModel.currentArtworkUri.value?.toString(),
@@ -871,14 +893,14 @@ private fun FullPlayerOverlay(viewModel: PodcastViewModel) {
         onSeekForward = { viewModel.seekForward() },
         onSeekBackward = { viewModel.seekBackward() },
         onMinimizeClick = { viewModel.minimizePlayer() },
-        currentPosition = viewModel.currentPosition.value,
+        currentPosition = shownPosition,
         duration = viewModel.duration.value,
         onSeek = { positionMs -> viewModel.seekTo(positionMs) },
         skipSeconds = viewModel.skipSeconds.value,
         isKeepScreenOnEnabled = viewModel.isKeepScreenOnEnabled.value,
         onKeepScreenOnToggle = { enabled -> viewModel.setKeepScreenOnEnabled(enabled) },
         isSleepTimerActive = viewModel.isSleepTimerActive.value,
-        sleepTimerRemainingSeconds = viewModel.sleepTimerRemainingSeconds.value,
+        sleepTimerRemainingSeconds = shownSleepSeconds,
         onStartSleepTimer = { viewModel.startSleepTimer() },
         onStopSleepTimer = { viewModel.stopSleepTimer() },
         onSleepTimerMinutesChange = { minutes -> viewModel.setSleepTimerMinutes(minutes) },

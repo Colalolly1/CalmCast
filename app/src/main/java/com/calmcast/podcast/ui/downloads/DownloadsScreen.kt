@@ -46,6 +46,7 @@ fun DownloadsScreen(
     onPauseClick: (Episode) -> Unit = {},
     onCancelClick: (Episode) -> Unit = {},
     onResumeClick: (Episode) -> Unit = {},
+    onRetryClick: (Episode) -> Unit = {},
     removeDividers: Boolean = false
 ) {
     val hasError = remember { mutableStateOf(false) }
@@ -152,6 +153,7 @@ fun DownloadsScreen(
                         onPauseClick = { onPauseClick(download.episode) },
                         onCancelClick = { onCancelClick(download.episode) },
                         onResumeClick = { onResumeClick(download.episode) },
+                        onRetryClick = { onRetryClick(download.episode) },
                         onInfoClick = { selectedEpisodeForInfo = download.episode },
                         removeDividers = removeDividers,
                         customPaddingValues = PaddingValues(

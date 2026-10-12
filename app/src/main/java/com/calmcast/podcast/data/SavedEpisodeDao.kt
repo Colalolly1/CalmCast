@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import kotlinx.coroutines.flow.Flow
 
 @Dao
 interface SavedEpisodeDao {
@@ -14,6 +15,9 @@ interface SavedEpisodeDao {
     // ASC = play-queue order: first queued plays first. Reordering swaps savedAt values.
     @Query("SELECT * FROM saved_episodes ORDER BY savedAt ASC, episodeId ASC")
     suspend fun getAll(): List<SavedEpisode>
+
+    @Query("SELECT * FROM saved_episodes ORDER BY savedAt ASC, episodeId ASC")
+    fun observeAll(): Flow<List<SavedEpisode>>
 
     @Query("SELECT episodeId FROM saved_episodes")
     suspend fun getAllIds(): List<String>

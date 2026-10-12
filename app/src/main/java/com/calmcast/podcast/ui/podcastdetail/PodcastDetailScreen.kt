@@ -87,6 +87,7 @@ fun PodcastDetailScreen(
     onPauseClick: (Episode) -> Unit = {},
     onCancelClick: (Episode) -> Unit = {},
     onResumeClick: (Episode) -> Unit = {},
+    onRetryClick: (Episode) -> Unit = {},
     onRefreshClick: () -> Unit = {},
     onSaveClick: (Episode) -> Unit = {},
     isSaved: (String) -> Boolean = { false },
@@ -396,6 +397,7 @@ fun PodcastDetailScreen(
                             onPauseClick = { onPauseClick(episode) },
                             onCancelClick = { onCancelClick(episode) },
                             onResumeClick = { onResumeClick(episode) },
+                            onRetryClick = { onRetryClick(episode) },
                             onInfoClick = { selectedEpisodeForInfo = episode },
                             onSaveClick = { onSaveClick(episode) },
                             isSaved = isSaved(episode.id),
@@ -426,6 +428,7 @@ fun EpisodeItem(
     onPauseClick: () -> Unit = {},
     onCancelClick: () -> Unit = {},
     onResumeClick: () -> Unit = {},
+    onRetryClick: () -> Unit = {},
     onInfoClick: () -> Unit = {},
     onSaveClick: () -> Unit = {},
     isSaved: Boolean = false,
@@ -556,7 +559,19 @@ fun EpisodeItem(
                             tint = MaterialTheme.colorScheme.secondary
                         )
                     }
-                    DownloadStatus.FAILED, DownloadStatus.CANCELED, DownloadStatus.STORAGE_UNAVAILABLE -> {
+                    DownloadStatus.FAILED -> {
+                        IconButton(
+                            onClick = onRetryClick,
+                            modifier = Modifier.size(20.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Refresh,
+                                contentDescription = "Retry download",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                    DownloadStatus.CANCELED, DownloadStatus.STORAGE_UNAVAILABLE -> {
                         IconButton(
                             onClick = onDeleteClick,
                             modifier = Modifier.size(20.dp)
@@ -696,6 +711,33 @@ fun EpisodeItem(
                                     Icon(
                                         imageVector = Icons.Outlined.Close,
                                         contentDescription = "Cancel",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        DownloadStatus.FAILED -> {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Download failed",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    modifier = Modifier.weight(1f)
+                                )
+
+                                IconButton(
+                                    onClick = onCancelClick,
+                                    modifier = Modifier.size(16.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Close,
+                                        contentDescription = "Discard download",
                                         modifier = Modifier.size(16.dp)
                                     )
                                 }

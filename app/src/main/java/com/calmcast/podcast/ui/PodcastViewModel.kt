@@ -48,6 +48,7 @@ import com.calmcast.podcast.data.DownloadLocation
 import com.calmcast.podcast.data.download.Download
 import com.calmcast.podcast.data.download.DownloadDao
 import com.calmcast.podcast.data.download.DownloadManager
+import com.calmcast.podcast.data.download.DownloadStatus
 import com.calmcast.podcast.data.download.StorageManager
 import com.calmcast.podcast.utils.DateTimeFormatter
 import com.google.common.util.concurrent.ListenableFuture
@@ -56,14 +57,13 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.Cache
@@ -86,8 +86,6 @@ class PodcastViewModel(
     companion object {
         private const val TAG = "PodcastViewModel"
         private const val SEARCH_DEBOUNCE_MS = 500L
-        // Survives ViewModel destruction so final saves can complete off the main thread.
-        private val teardownScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     }
 
     private val subscriptionManager = SubscriptionManager(application, podcastDao)
@@ -245,14 +243,9 @@ class PodcastViewModel(
     val savedEpisodeIds: State<Set<String>> = _savedEpisodeIds
 
     private var searchJob: Job? = null
-    private var sleepTimerJob: Job? = null
     private var recoveryJob: Job? = null
     private var detailFetchJob: Job? = null
-    private var lastQueueAdvanceAtMs = 0L
-    private var rapidQueueAdvances = 0
     private val queueMutex = kotlinx.coroutines.sync.Mutex()
-    private var lastSaveTime: Long = 0L
-    private val SAVE_INTERVAL_MS = 10000L // 10 seconds
 
     private enum class AutoplayContext {
         PODCAST,
@@ -310,7 +303,6 @@ class PodcastViewModel(
         _removeHorizontalDividers.value = settingsManager.removeHorizontalDividersSync()
         _sleepTimerEnabled.value = settingsManager.isSleepTimerEnabledSync()
         _sleepTimerMinutes.intValue = settingsManager.getSleepTimerMinutesSync()
-        _isSleepTimerActive.value = settingsManager.isSleepTimerActiveSync()
         _downloadLocation.value = settingsManager.getDownloadLocationSync()
         _playbackSpeed.value = settingsManager.getPlaybackSpeedSync()
         _isWiFiOnlyDownloadsEnabled.value = settingsManager.isWiFiOnlyDownloadsEnabledSync()
@@ -360,12 +352,11 @@ class PodcastViewModel(
                 _sleepTimerMinutes.intValue = it
             }
         }
+        // The timer runs in PlaybackService so it still fires with the app's screen gone.
         viewModelScope.launch {
-            settingsManager.isSleepTimerActive.collect {
-                _isSleepTimerActive.value = it
-                if (!it) {
-                    stopSleepTimer()
-                }
+            PlaybackService.sleepTimerRemainingSeconds.collect { seconds ->
+                _sleepTimerRemainingSeconds.longValue = seconds
+                _isSleepTimerActive.value = seconds > 0
             }
         }
         viewModelScope.launch {
@@ -491,9 +482,20 @@ class PodcastViewModel(
         }
     }
 
+    // In memory only, so progress in the lists stays current. PlaybackService writes the database.
+    private fun rememberPosition(episodeId: String, position: Long) {
+        _playbackPositions.value = _playbackPositions.value +
+            (episodeId to PlaybackPosition(episodeId, position, System.currentTimeMillis()))
+    }
+
     private fun persistSnapshot() {
         val episode = _currentEpisode.value ?: return
-        val position = _currentPosition.longValue
+        val controller = mediaController
+        val position = if (controller != null && controller.currentMediaItem?.mediaId == episode.id) {
+            controller.currentPosition
+        } else {
+            _currentPosition.longValue
+        }
         val speed = _playbackSpeed.value
         val context = lastAutoplayContext.name
         val artwork = _currentArtworkUri.value?.toString()
@@ -518,7 +520,13 @@ class PodcastViewModel(
                 startPositionUpdates()
             } else {
                 stopPositionUpdates()
-                persistSnapshot()
+                // PlaybackService saves the position; this only refreshes the lists on screen.
+                val episodeId = mediaController?.currentMediaItem?.mediaId
+                val position = mediaController?.currentPosition ?: 0L
+                if (episodeId != null && position > 0) {
+                    _currentPosition.longValue = position
+                    rememberPosition(episodeId, position)
+                }
             }
         }
 
@@ -542,49 +550,18 @@ class PodcastViewModel(
                 }
             }
 
-            // The queue outranks implicit autoplay: queueing an episode is an explicit
-            // "play this next" request, so advance regardless of the autoplay setting.
             if (playbackState == Player.STATE_ENDED) {
-                val endedId = _currentEpisode.value?.id
-                val queue = _savedEpisodes.value
-                val nextInQueue = queue.firstOrNull { it.episodeId != endedId }
-                if (endedId != null && queue.any { it.episodeId == endedId }) {
-                    // Finished a queued episode — consume it from the queue.
-                    removeSavedEpisode(endedId)
+                val endedId = mediaController?.currentMediaItem?.mediaId ?: _currentEpisode.value?.id
+                if (endedId != null) {
+                    // PlaybackService stores the full length; mirror it so the lists show it played.
+                    val controllerDuration = mediaController?.duration ?: 0L
+                    val fullMs = if (controllerDuration > 0) controllerDuration
+                    else (DateTimeFormatter.parseDuration(_currentEpisode.value?.duration) ?: 0L) * 1000L
+                    if (fullMs > 0) rememberPosition(endedId, fullMs)
                 }
-                if (nextInQueue != null) {
-                    // Cascade breaker: if episodes are "finishing" instantly (bad stored
-                    // position, dead audio), stop advancing instead of machine-gunning
-                    // through — and silently consuming — the entire queue.
-                    val now = System.currentTimeMillis()
-                    if (now - lastQueueAdvanceAtMs < 5000) {
-                        rapidQueueAdvances++
-                    } else {
-                        rapidQueueAdvances = 0
-                    }
-                    lastQueueAdvanceAtMs = now
-                    if (rapidQueueAdvances >= 3) {
-                        com.calmcast.podcast.util.CrashLogger.log(
-                            TAG, "Queue: halting auto-advance after $rapidQueueAdvances instant-end cycles"
-                        )
-                    } else {
-                        // If the queued episode has prior progress but an unparseable
-                        // duration, we can't run the near-end reset guard — restart from
-                        // zero rather than risk starting at the end and instantly ending.
-                        val storedPos = _playbackPositions.value[nextInQueue.episodeId]?.position ?: 0L
-                        val durationKnown = DateTimeFormatter.parseDuration(nextInQueue.duration) != null
-                        val restartFromZero = storedPos > 0 && !durationKnown
-                        com.calmcast.podcast.util.CrashLogger.log(
-                            TAG, "Queue: advancing to ${nextInQueue.episodeTitle.take(40)} restart=$restartFromZero"
-                        )
-                        playEpisode(
-                            savedEpisodeToEpisode(nextInQueue),
-                            restart = restartFromZero,
-                            context = lastAutoplayContext
-                        )
-                        return
-                    }
-                }
+                // PlaybackService plays the next queued episode itself, so this works with
+                // the app's screen gone; the queue outranks autoplay.
+                if (endedId != null && PlaybackService.queueAdvancedFrom == endedId) return
             }
 
             if (playbackState == Player.STATE_ENDED && settingsManager.isAutoPlayNextEpisodeEnabledSync()) {
@@ -596,7 +573,7 @@ class PodcastViewModel(
                         val currentIndex = episodes?.indexOfFirst { it.id == currentId } ?: -1
                         val nextEpisode = if (currentIndex > 0) episodes?.get(currentIndex - 1) else null
                         if (nextEpisode != null) {
-                            playEpisode(nextEpisode, restart = true, context = AutoplayContext.PODCAST)
+                            playEpisode(nextEpisode, context = AutoplayContext.PODCAST)
                             handled = true
                         }
                     }
@@ -614,7 +591,7 @@ class PodcastViewModel(
                         val currentIndex = downloadsOrdered.indexOfFirst { it.episode.id == currentId }
                         val nextDownload = if (currentIndex > 0) downloadsOrdered.getOrNull(currentIndex - 1) else null
                         if (nextDownload != null) {
-                            playEpisode(nextDownload.episode, restart = true, context = AutoplayContext.DOWNLOADS)
+                            playEpisode(nextDownload.episode, context = AutoplayContext.DOWNLOADS)
                             handled = true
                         }
                     }
@@ -717,6 +694,14 @@ class PodcastViewModel(
 
         val mediaId = mediaItem.mediaId
 
+        // A different episode, possibly started by PlaybackService from the queue.
+        if (mediaId != _currentEpisode.value?.id) {
+            _chapters.value = emptyList()
+            _currentChapterIndex.intValue = -1
+            mediaItem.mediaMetadata.artworkUri?.let { _currentArtworkUri.value = it }
+            loadListenHistory()
+        }
+
         // 1) Prefer a fully populated episode from downloads
         val fromDownload = _downloads.value.find { it.episode.id == mediaId }?.episode
         if (fromDownload != null) {
@@ -757,14 +742,20 @@ class PodcastViewModel(
         stopPositionUpdates()
     }
 
+    // Only a finished download is a playable file; a failed or paused one is a partial.
+    private fun downloadedFileUri(episodeId: String): String? =
+        _downloads.value.find { it.episode.id == episodeId }
+            ?.takeIf { it.status == DownloadStatus.DOWNLOADED }
+            ?.downloadUri
+
     private fun preparePlayerForRestoredItem(episode: Episode, startPositionMs: Long) {
         val controller = mediaController ?: return
 
         // Ensure we have correct URL (downloaded or stream)
         var episodeToPlay = episode
-        val download = _downloads.value.find { it.episode.id == episode.id }
-        if (download?.downloadUri != null) {
-            episodeToPlay = episode.copy(audioUrl = download.downloadUri)
+        val downloadedUri = downloadedFileUri(episode.id)
+        if (downloadedUri != null) {
+            episodeToPlay = episode.copy(audioUrl = downloadedUri)
         } else if (episode.downloadedPath != null) {
             episodeToPlay = episode.copy(audioUrl = episode.downloadedPath)
         }
@@ -874,27 +865,7 @@ class PodcastViewModel(
                     }
                 }
 
-                if (_currentEpisode.value != null && _currentPosition.longValue > 0) {
-                    val currentTime = System.currentTimeMillis()
-                    if (currentTime - lastSaveTime >= SAVE_INTERVAL_MS) {
-                        lastSaveTime = currentTime
-                        val episodeId = _currentEpisode.value!!.id
-                        val position = _currentPosition.longValue
-                        repository.savePlaybackPosition(
-                            episodeId = episodeId,
-                            position = position
-                        )
-                        val updatedPosition = PlaybackPosition(
-                            episodeId = episodeId,
-                            position = position,
-                            lastPlayed = currentTime
-                        )
-                        _playbackPositions.value = _playbackPositions.value + (episodeId to updatedPosition)
-
-                        // Persist snapshot periodically
-                        persistSnapshot()
-                    }
-                }
+                // Saving is PlaybackService's job; this loop only feeds the screen.
                 // 1s tick: e-ink refresh is slow; faster updates just burn CPU on recomposition
                 delay(1000)
             }
@@ -1132,26 +1103,16 @@ class PodcastViewModel(
                                 }
 
                                 if (settingsManager.isAutoDownloadEnabled() && index > 0) {
-                                    // Check WiFi requirement if enabled
-                                    val shouldDownload = if (settingsManager.isWiFiOnlyDownloadsEnabledSync()) {
-                                        com.calmcast.podcast.util.NetworkUtil.isConnectedToWiFi(application)
-                                    } else {
-                                        true
-                                    }
+                                    // The Wi-Fi-only setting is applied by the download job as a
+                                    // network constraint, so new episodes wait for Wi-Fi.
+                                    val newEpisodes = it.slice(0 until index)
 
-                                    if (shouldDownload) {
-                                        val newEpisodes = it.slice(0 until index)
-
-                                        newEpisodes.forEach { episode ->
-                                            val existingDownload = _downloads.value.find { dl -> dl.episode.id == episode.id }
-                                            // Only auto-download if:
-                                            // 1. No record exists (never attempted)
-                                            // 2. Status is not DELETED (user didn't explicitly delete it)
-                                            if (existingDownload == null || existingDownload.status != com.calmcast.podcast.data.download.DownloadStatus.DELETED) {
-                                                if (existingDownload?.status !in listOf(com.calmcast.podcast.data.download.DownloadStatus.DOWNLOADING, com.calmcast.podcast.data.download.DownloadStatus.DOWNLOADED, com.calmcast.podcast.data.download.DownloadStatus.PAUSED)) {
-                                                    downloadManager.startDownload(episode)
-                                                }
-                                            }
+                                    newEpisodes.forEach { episode ->
+                                        val status = _downloads.value.find { dl -> dl.episode.id == episode.id }?.status
+                                        // Skip only what the user deleted or what is already done. Paused
+                                        // and failed still need downloading; a pending job is left alone.
+                                        if (status != DownloadStatus.DELETED && status != DownloadStatus.DOWNLOADED) {
+                                            downloadManager.startAutoDownload(episode)
                                         }
                                     }
                                 }
@@ -1196,19 +1157,13 @@ class PodcastViewModel(
         _chapters.value = emptyList()
         _currentChapterIndex.intValue = -1
 
+        // The outgoing episode's position is saved by PlaybackService as it is replaced.
         viewModelScope.launch {
-            if (_currentEpisode.value != null && _currentPosition.longValue > 0) {
-                repository.savePlaybackPosition(
-                    episodeId = _currentEpisode.value!!.id,
-                    position = _currentPosition.longValue
-                )
-            }
-
             var episodeToPlay = episode
 
-            val download = _downloads.value.find { it.episode.id == episode.id }
-            if (download?.downloadUri != null) {
-                episodeToPlay = episode.copy(audioUrl = download.downloadUri)
+            val downloadedUri = downloadedFileUri(episode.id)
+            if (downloadedUri != null) {
+                episodeToPlay = episode.copy(audioUrl = downloadedUri)
             } else if (episode.downloadedPath != null) {
                 episodeToPlay = episode.copy(audioUrl = episode.downloadedPath)
             }
@@ -1225,6 +1180,11 @@ class PodcastViewModel(
             var lastPosition = 0L
             if (!restart) {
                 lastPosition = repository.getPlaybackPosition(episode.id)?.position ?: 0L
+                // Already loaded: the live position is newer than the last periodic save.
+                val controller = mediaController
+                if (controller != null && controller.currentMediaItem?.mediaId == episode.id) {
+                    lastPosition = controller.currentPosition
+                }
                 val durationInSeconds = DateTimeFormatter.parseDuration(episode.duration)
                 if (durationInSeconds != null && lastPosition > 0) {
                     val durationInMilliseconds = durationInSeconds * 1000
@@ -1273,6 +1233,7 @@ class PodcastViewModel(
             }
 
             _currentEpisode.value = episodeToPlay
+            _currentPosition.longValue = lastPosition
             _showFullPlayer.value = showFullPlayer
             persistSnapshot()
             recordListenHistory(episode)
@@ -1297,44 +1258,23 @@ class PodcastViewModel(
             }
             mediaController?.play()
         }
-        if (!_isPlaying.value && _currentEpisode.value != null && _currentPosition.longValue > 0) {
-            viewModelScope.launch {
-                repository.savePlaybackPosition(
-                    episodeId = _currentEpisode.value!!.id,
-                    position = _currentPosition.longValue
-                )
-                persistSnapshot()
-            }
-        }
     }
 
     fun seekForward() {
-        val newPosition = (mediaController?.currentPosition ?: 0L) + (_skipSeconds.intValue * 1000L)
-        mediaController?.seekTo(newPosition)
-        saveCurrentPosition()
+        seekTo((mediaController?.currentPosition ?: 0L) + (_skipSeconds.intValue * 1000L))
     }
 
     fun seekBackward() {
-        val newPosition = (mediaController?.currentPosition ?: 0L) - (_skipSeconds.intValue * 1000L)
-        mediaController?.seekTo(newPosition)
-        saveCurrentPosition()
+        seekTo((mediaController?.currentPosition ?: 0L) - (_skipSeconds.intValue * 1000L))
     }
 
-    private fun saveCurrentPosition() {
-        if (_currentEpisode.value != null && _currentPosition.longValue > 0) {
-            viewModelScope.launch {
-                repository.savePlaybackPosition(
-                    episodeId = _currentEpisode.value!!.id,
-                    position = _currentPosition.longValue
-                )
-                persistSnapshot()
-            }
-        }
-    }
-
+    // PlaybackService writes the new position to the database when the seek lands.
     fun seekTo(positionMs: Long) {
-        mediaController?.seekTo(positionMs)
-        saveCurrentPosition()
+        val duration = mediaController?.duration ?: 0L
+        val target = if (duration > 0) positionMs.coerceIn(0L, duration) else positionMs.coerceAtLeast(0L)
+        mediaController?.seekTo(target)
+        // Show it straight away; the 1s update loop only runs while playing.
+        _currentPosition.longValue = target
     }
 
     fun seekToChapter(index: Int) {
@@ -1378,6 +1318,11 @@ class PodcastViewModel(
         downloadManager.startDownload(episode)
     }
 
+    // Starts the job again; it resumes from whatever partial file is on disk.
+    fun retryDownload(episode: Episode) {
+        downloadManager.startDownload(episode)
+    }
+
     fun pauseDownload(episodeId: String) {
         downloadManager.pauseDownload(episodeId)
     }
@@ -1395,14 +1340,15 @@ class PodcastViewModel(
     }
 
     /**
-     * Disk usage of downloads, grouped per podcast, largest first. Includes PAUSED
-     * partials — they hold real bytes on disk and would otherwise be invisible.
+     * Disk usage of downloads, grouped per podcast, largest first. Includes PAUSED and
+     * FAILED partials — they hold real bytes on disk and would otherwise be invisible.
      */
     fun computeStorageUsage(): List<PodcastStorageUsage> =
         _downloads.value
             .filter {
                 it.status == com.calmcast.podcast.data.download.DownloadStatus.DOWNLOADED ||
-                        it.status == com.calmcast.podcast.data.download.DownloadStatus.PAUSED
+                        it.status == com.calmcast.podcast.data.download.DownloadStatus.PAUSED ||
+                        it.status == com.calmcast.podcast.data.download.DownloadStatus.FAILED
             }
             .groupBy { it.episode.podcastId }
             .map { (podcastId, group) ->
@@ -1411,7 +1357,12 @@ class PodcastViewModel(
                     podcastTitle = group.first().episode.podcastTitle.ifBlank { "Unknown podcast" },
                     episodeCount = group.size,
                     totalBytes = group.sumOf { d ->
-                        if (d.downloadedBytes > 0) d.downloadedBytes else d.totalBytes.coerceAtLeast(0L)
+                        when {
+                            d.downloadedBytes > 0 -> d.downloadedBytes
+                            // Older finished downloads only recorded the total.
+                            d.status == DownloadStatus.DOWNLOADED -> d.totalBytes.coerceAtLeast(0L)
+                            else -> 0L
+                        }
                     }
                 )
             }
@@ -1484,6 +1435,8 @@ class PodcastViewModel(
         settingsManager.setPlaybackSpeed(speed)
         _playbackSpeed.value = speed
         applyPlaybackSpeed(speed)
+        // The snapshot carries the speed a cold start restores.
+        persistSnapshot()
     }
 
     fun cyclePlaybackSpeed() {
@@ -1502,34 +1455,11 @@ class PodcastViewModel(
     }
 
     fun startSleepTimer() {
-        if (_sleepTimerMinutes.intValue <= 0) return
-
-        _isSleepTimerActive.value = true
-        settingsManager.setSleepTimerActive(true)
-        _sleepTimerRemainingSeconds.longValue = (_sleepTimerMinutes.intValue * 60).toLong()
-
-        sleepTimerJob?.cancel()
-        sleepTimerJob = viewModelScope.launch {
-            while (_sleepTimerRemainingSeconds.longValue > 0) {
-                delay(1000)
-                _sleepTimerRemainingSeconds.longValue -= 1
-            }
-
-            if (_sleepTimerRemainingSeconds.longValue <= 0) {
-                mediaController?.pause()
-                _isSleepTimerActive.value = false
-                settingsManager.setSleepTimerActive(false)
-                _sleepTimerRemainingSeconds.longValue = 0L
-            }
-        }
+        PlaybackService.startSleepTimer(_sleepTimerMinutes.intValue)
     }
 
     fun stopSleepTimer() {
-        sleepTimerJob?.cancel()
-        sleepTimerJob = null
-        _isSleepTimerActive.value = false
-        settingsManager.setSleepTimerActive(false)
-        _sleepTimerRemainingSeconds.longValue = 0L
+        PlaybackService.stopSleepTimer()
     }
 
     fun setAutoPlayEpisodeEnabled(enabled: Boolean) {
@@ -1597,15 +1527,15 @@ class PodcastViewModel(
         }
     }
 
+    // Observed, not loaded once: PlaybackService consumes finished episodes from the queue.
     private fun loadSavedEpisodes() {
-        viewModelScope.launch {
-            try {
-                _savedEpisodes.value = savedEpisodeDao.getAll()
-                _savedEpisodeIds.value = savedEpisodeDao.getAllIds().toSet()
-            } catch (e: Exception) {
-                Log.e(TAG, "Error loading saved episodes", e)
+        savedEpisodeDao.observeAll()
+            .onEach { saved ->
+                _savedEpisodes.value = saved
+                _savedEpisodeIds.value = saved.map { it.episodeId }.toSet()
             }
-        }
+            .catch { e -> Log.e(TAG, "Error loading saved episodes", e) }
+            .launchIn(viewModelScope)
     }
 
     fun toggleSaveEpisode(episode: Episode) {
@@ -1629,6 +1559,11 @@ class PodcastViewModel(
                             savedAt = System.currentTimeMillis()
                         )
                     )
+                    // Queued means "play this soon": fetch it, waiting for Wi-Fi if the setting says so.
+                    val status = _downloads.value.find { it.episode.id == episode.id }?.status
+                    if (status != DownloadStatus.DOWNLOADED && status != DownloadStatus.DOWNLOADING) {
+                        downloadManager.startAutoDownload(episode)
+                    }
                 }
                 _savedEpisodes.value = savedEpisodeDao.getAll()
                 _savedEpisodeIds.value = savedEpisodeDao.getAllIds().toSet()
@@ -1884,33 +1819,9 @@ class PodcastViewModel(
         super.onCleared()
         mediaController?.removeListener(playerListener)
         PlaybackService.setErrorCallback(null)
-        sleepTimerJob?.cancel()
         recoveryJob?.cancel()
-        // Best-effort final save. viewModelScope is already cancelled here, so we use a
-        // process-lifetime scope. Do NOT runBlocking on the main thread (causes ANR/freeze).
-        val ep = _currentEpisode.value
-        val pos = _currentPosition.longValue
-        if (ep != null && pos > 0) {
-            val speed = _playbackSpeed.value
-            val context = lastAutoplayContext.name
-            val artwork = _currentArtworkUri.value?.toString()
-            teardownScope.launch {
-                try {
-                    repository.savePlaybackPosition(episodeId = ep.id, position = pos)
-                    nowPlayingStorage.save(
-                        PodcastSnapshot(
-                            episode = ep,
-                            contextType = context,
-                            positionMs = pos,
-                            playbackSpeed = speed,
-                            artworkUrl = artwork
-                        )
-                    )
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error saving state on clear", e)
-                }
-            }
-        }
+        // No final save here: PlaybackService keeps saving the position, and the sleep
+        // timer keeps running, after this screen is gone.
         controllerFuture?.let {
             MediaController.releaseFuture(it)
         }

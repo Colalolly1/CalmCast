@@ -69,6 +69,12 @@ class NowPlayingStorage(context: Context) {
         )
     }
 
+    /** Updates only the position, and only if the snapshot is for this episode. */
+    fun savePosition(episodeId: String, positionMs: Long) {
+        if (prefs.getString(KEY_EP_ID, null) != episodeId) return
+        prefs.edit().putLong(KEY_POSITION_MS, positionMs).apply()
+    }
+
     fun clear() {
         prefs.edit().clear().apply()
     }

@@ -66,6 +66,7 @@ class CalmCastApplication : Application(), Configuration.Provider {
 
         CoroutineScope(Dispatchers.IO).launch {
             downloadDao.deleteInvalidDownloads()
+            downloadManager.pauseOrphanedDownloads()
         }
 
         AppLifecycleTracker.initialize(

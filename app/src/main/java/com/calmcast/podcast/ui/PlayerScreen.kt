@@ -291,16 +291,27 @@ fun FullPlayerScreen(
                 }
             }
 
+            // E-ink: like the Continue Listening strip, show whole minutes so the screen
+            // redraws about once a minute rather than every second.
+            val elapsedMinutes = currentPosition / 60_000L
+            val sleepMinutes = (sleepTimerRemainingSeconds + 59) / 60
+            // Dragging only moves the thumb; the seek, and its database write, happen on release.
+            var dragFraction by remember { mutableStateOf<Float?>(null) }
+
             Column(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 SliderMMD(
                     modifier = Modifier.fillMaxWidth(),
-                    value = if (duration > 0) currentPosition.toFloat() / duration else 0f,
-                    onValueChange = { newValue ->
-                        if (duration > 0) {
-                            onSeek((newValue * duration).toLong())
+                    value = dragFraction
+                        ?: if (duration > 0) (elapsedMinutes * 60_000L).toFloat() / duration else 0f,
+                    onValueChange = { newValue -> dragFraction = newValue },
+                    onValueChangeFinished = {
+                        val target = dragFraction
+                        if (target != null && duration > 0) {
+                            onSeek((target * duration).toLong())
                         }
+                        dragFraction = null
                     },
                 )
 
@@ -310,15 +321,20 @@ fun FullPlayerScreen(
                         .padding(horizontal = 12.dp),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
+                    val dragging = dragFraction
                     Text(
-                        text = DateTimeFormatter.formatDuration(currentPosition / 1000),
+                        text = if (dragging != null) {
+                            DateTimeFormatter.formatDuration((dragging * duration).toLong() / 1000)
+                        } else {
+                            formatMinutes(elapsedMinutes)
+                        },
                         fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold
                     )
 
                     if (isSleepTimerActive) {
                         Text(
-                            text = "Sleep: ${DateTimeFormatter.formatDuration(sleepTimerRemainingSeconds)}",
+                            text = "Sleep: ${formatMinutes(sleepMinutes)}",
                             fontSize = 14.sp,
                             fontWeight = FontWeight.SemiBold
                         )
@@ -624,6 +640,9 @@ fun FullPlayerScreen(
         }
     }
 }
+
+private fun formatMinutes(minutes: Long): String =
+    if (minutes >= 60) "${minutes / 60}h ${minutes % 60}m" else "$minutes min"
 
 private fun formatTime(ms: Long): String {
     val totalSec = ms / 1000

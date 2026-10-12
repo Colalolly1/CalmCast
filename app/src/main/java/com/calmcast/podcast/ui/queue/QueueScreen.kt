@@ -263,7 +263,7 @@ fun QueueItem(
                         imageVector = Icons.Filled.KeyboardArrowUp,
                         contentDescription = "Move up in queue",
                         modifier = Modifier.size(28.dp),
-                        tint = if (isFirst) Color.LightGray else Color.Black
+                        tint = if (isFirst) Color(0xFF777777) else Color.Black
                     )
                 }
                 IconButton(
@@ -275,7 +275,7 @@ fun QueueItem(
                         imageVector = Icons.Filled.KeyboardArrowDown,
                         contentDescription = "Move down in queue",
                         modifier = Modifier.size(28.dp),
-                        tint = if (isLast) Color.LightGray else Color.Black
+                        tint = if (isLast) Color(0xFF777777) else Color.Black
                     )
                 }
             }

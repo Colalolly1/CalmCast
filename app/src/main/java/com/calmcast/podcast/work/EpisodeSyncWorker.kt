@@ -15,7 +15,6 @@ import com.calmcast.podcast.data.PodcastDatabase
 import com.calmcast.podcast.data.PodcastRepository
 import com.calmcast.podcast.data.SettingsManager
 import com.calmcast.podcast.data.download.DownloadStatus
-import com.calmcast.podcast.util.NetworkUtil
 import kotlinx.coroutines.flow.first
 import java.util.concurrent.TimeUnit
 
@@ -44,8 +43,6 @@ class EpisodeSyncWorker(
             Log.d(TAG, "Syncing ${subscriptions.size} podcasts")
 
             val autoDownload = settingsManager.isAutoDownloadEnabled()
-            val wifiOnly = settingsManager.isWiFiOnlyDownloadsEnabledSync()
-            val canDownload = !wifiOnly || NetworkUtil.isConnectedToWiFi(applicationContext)
 
             for (podcast in subscriptions) {
                 try {
@@ -62,7 +59,7 @@ class EpisodeSyncWorker(
                     if (newEpisodeIndex > 0) {
                         podcastDao.updateNewEpisodeCount(podcast.id, newEpisodeIndex)
 
-                        if (autoDownload && canDownload) {
+                        if (autoDownload) {
                             val newEpisodes = episodes.slice(0 until newEpisodeIndex)
                             for (episode in newEpisodes) {
                                 // Look up by the real episode id — the previous hashCode-based
@@ -70,12 +67,12 @@ class EpisodeSyncWorker(
                                 // (and could even be deleted by the stale-resume path).
                                 val existing = downloadDao.getByEpisodeId(episode.id)
                                 val status = existing?.status
+                                // Paused or failed still need downloading. This only queues the
+                                // download job; a job already pending for the episode is left alone.
                                 if (status != DownloadStatus.DELETED &&
-                                    status != DownloadStatus.DOWNLOADING &&
-                                    status != DownloadStatus.DOWNLOADED &&
-                                    status != DownloadStatus.PAUSED) {
+                                    status != DownloadStatus.DOWNLOADED) {
                                     Log.d(TAG, "Auto-downloading: ${episode.title}")
-                                    app.downloadManager.startDownload(episode)
+                                    app.downloadManager.enqueueDownload(episode, userInitiated = false)
                                 }
                             }
                         }

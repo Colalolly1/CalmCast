@@ -26,6 +26,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -33,6 +34,7 @@ import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -56,12 +58,18 @@ class AndroidDownloadManager(
 
     companion object {
         private const val TAG = "AndroidDownloadManager"
+        // "bytes 1000-1999/2000"; the total may be "*".
+        private val CONTENT_RANGE = Regex("""bytes (\d+)-\d+/(\d+|\*)""")
 
         fun workName(episodeId: String) = "download_$episodeId"
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val workManager by lazy { WorkManager.getInstance(context) }
+    // ETag or Last-Modified of the response each partial file came from, by episode id.
+    private val validators by lazy {
+        context.getSharedPreferences("download_validators", Context.MODE_PRIVATE)
+    }
 
     private val activeCalls = ConcurrentHashMap<String, Call>()
     // Episodes the user paused or removed, so a job that is unwinding doesn't treat it as a network drop.
@@ -92,7 +100,8 @@ class AndroidDownloadManager(
             stopRequested.remove(episode.id)
 
             val wifiOnly = !userInitiated && settingsManager.isWiFiOnlyDownloadsEnabledSync()
-            val canStartNow = !wifiOnly || NetworkUtil.isConnectedToWiFi(context)
+            // The same test as the job's UNMETERED constraint below.
+            val canStartNow = !wifiOnly || NetworkUtil.isOnUnmeteredNetwork(context)
             val existing = downloadDao.getByEpisodeId(episode.id)
             downloadDao.insert(
                 Download(
@@ -183,6 +192,8 @@ class AndroidDownloadManager(
             val requestBuilder = Request.Builder().url(episode.audioUrl)
             if (bytesAlready > 0) {
                 requestBuilder.addHeader("Range", "bytes=$bytesAlready-")
+                // If the file has changed since, the server sends all of it and we start over.
+                validators.getString(episodeId, null)?.let { requestBuilder.addHeader("If-Range", it) }
             }
             val newCall = client.newCall(requestBuilder.build())
             call = newCall
@@ -205,11 +216,12 @@ class AndroidDownloadManager(
         } catch (e: IOException) {
             // Signal dropped or the call was cancelled. The partial file stays for the next attempt.
             Log.w(TAG, "Download interrupted for ${episode.title}: ${e.message}")
-            saveProgress(episodeId, file)
+            val jobStopped = !currentCoroutineContext().isActive
+            saveProgress(episodeId, file, systemStopped = jobStopped && !stopRequested.contains(episodeId))
             currentCoroutineContext().ensureActive()
             if (stopRequested.contains(episodeId)) DownloadOutcome.STOPPED else DownloadOutcome.RETRY
         } catch (e: CancellationException) {
-            saveProgress(episodeId, file)
+            saveProgress(episodeId, file, systemStopped = !stopRequested.contains(episodeId))
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Exception during download for episode ${episode.title}: ${e.message}", e)
@@ -234,6 +246,7 @@ class AndroidDownloadManager(
                 // The partial no longer lines up with the server's file; start over next attempt.
                 Log.w(TAG, "Range not satisfiable for episode: ${row.episode.title}. Retrying from scratch.")
                 file.delete()
+                forgetValidator(row.id)
                 return DownloadOutcome.RETRY
             }
             if (!response.isSuccessful) {
@@ -244,6 +257,15 @@ class AndroidDownloadManager(
             val body = response.body ?: return DownloadOutcome.RETRY
 
             val isResume = response.code == 206
+            if (isResume && !continuesPartial(response, row.totalBytes, bytesAlready, body.contentLength())) {
+                // A different version of the file: joining them would make one broken episode.
+                Log.w(TAG, "Server's file changed for episode: ${row.episode.title}. Retrying from scratch.")
+                file.delete()
+                forgetValidator(row.id)
+                return DownloadOutcome.RETRY
+            }
+            // A full response starts the file afresh; remember which version it is.
+            if (!isResume) rememberValidator(row.id, response)
             val startBytes = if (isResume) bytesAlready else 0L
             val serverBytes = body.contentLength()
             val totalBytes = if (serverBytes != -1L) startBytes + serverBytes else -1L
@@ -304,6 +326,29 @@ class AndroidDownloadManager(
         }
     }
 
+    // A resumed response must start where the partial ends, for a file of the size first reported.
+    private fun continuesPartial(response: Response, storedTotal: Long, bytesAlready: Long, bodyBytes: Long): Boolean {
+        val match = response.header("Content-Range")?.let { CONTENT_RANGE.find(it) }
+        val start = match?.groupValues?.get(1)?.toLongOrNull()
+        if (start != null && start != bytesAlready) return false
+        val serverTotal = match?.groupValues?.get(2)?.toLongOrNull()
+            ?: if (bodyBytes != -1L) bytesAlready + bodyBytes else -1L
+        return storedTotal <= 0 || serverTotal <= 0 || serverTotal == storedTotal
+    }
+
+    private fun rememberValidator(episodeId: String, response: Response) {
+        // A weak ETag never matches an If-Range, so prefer Last-Modified over one.
+        val etag = response.header("ETag")
+        val validator = etag?.takeUnless { it.startsWith("W/") } ?: response.header("Last-Modified") ?: etag
+        val editor = validators.edit()
+        if (validator != null) editor.putString(episodeId, validator) else editor.remove(episodeId)
+        editor.commit()
+    }
+
+    private fun forgetValidator(episodeId: String) {
+        validators.edit().remove(episodeId).commit()
+    }
+
     private fun fraction(bytes: Long, total: Long): Float =
         if (total > 0) bytes.toFloat() / total.toFloat() else -1f
 
@@ -312,12 +357,18 @@ class AndroidDownloadManager(
         return File(path).exists()
     }
 
-    // Records how far a stopped download got, leaving the status to whoever stopped it.
-    private suspend fun saveProgress(episodeId: String, file: File): Unit = withContext(NonCancellable) {
+    // Records how far a stopped download got, leaving the status to whoever stopped it. When the
+    // system stopped the job (Wi-Fi lost, say), WorkManager runs it again later: show it paused.
+    private suspend fun saveProgress(
+        episodeId: String,
+        file: File,
+        systemStopped: Boolean = false
+    ): Unit = withContext(NonCancellable) {
         val current = downloadDao.getByEpisodeId(episodeId) ?: return@withContext
         if (current.status != DownloadStatus.DOWNLOADING) return@withContext
         val bytes = if (file.exists()) file.length() else 0L
         downloadDao.insert(current.copy(
+            status = if (systemStopped) DownloadStatus.PAUSED else current.status,
             progress = fraction(bytes, current.totalBytes).coerceAtLeast(0f),
             downloadedBytes = bytes
         ))
@@ -403,6 +454,7 @@ class AndroidDownloadManager(
      * recomputing only the CURRENT base dir orphans files in the other location.
      */
     private fun deleteDownloadFiles(episodeId: String, episodeTitle: String, downloadUri: String?) {
+        forgetValidator(episodeId)
         try {
             downloadUri?.let { uri ->
                 Uri.parse(uri).path?.let { path ->

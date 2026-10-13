@@ -86,6 +86,7 @@ class PodcastViewModel(
     companion object {
         private const val TAG = "PodcastViewModel"
         private const val SEARCH_DEBOUNCE_MS = 500L
+        private const val INSTANT_END_MS = 5000L
     }
 
     private val subscriptionManager = SubscriptionManager(application, podcastDao)
@@ -253,6 +254,11 @@ class PodcastViewModel(
     }
 
     private var lastAutoplayContext: AutoplayContext = AutoplayContext.PODCAST
+
+    // When autoplay last started an episode (0 if the user picked it), and how many
+    // autoplayed episodes in a row ended within seconds of starting.
+    private var autoplayStartedAtMs = 0L
+    private var instantAutoplayEnds = 0
 
     private fun createCachedHttpClient(): OkHttpClient {
         val cacheDir = File(application.cacheDir, "http_rss_cache")
@@ -459,14 +465,21 @@ class PodcastViewModel(
             _currentEpisode.value = episode
             _currentPosition.longValue = positionMs
             _duration.longValue = DateTimeFormatter.parseDuration(episode.duration)?.times(1000L) ?: 0L
-            setPlaybackSpeed(speed)
+            lastAutoplayContext = if (contextType == AutoplayContext.PODCAST.name) {
+                AutoplayContext.PODCAST
+            } else {
+                AutoplayContext.DOWNLOADS
+            }
+            // Not setPlaybackSpeed: that saves a snapshot, and restoring should only read one.
+            settingsManager.setPlaybackSpeed(speed)
+            _playbackSpeed.value = speed
+            applyPlaybackSpeed(speed)
 
             if (artworkUrl != null) {
                 _currentArtworkUri.value = artworkUrl.toUri()
             }
 
-            if (contextType == AutoplayContext.PODCAST.name) {
-                lastAutoplayContext = AutoplayContext.PODCAST
+            if (lastAutoplayContext == AutoplayContext.PODCAST) {
                 launch {
                     val details = repository.getPodcastDetails(episode.podcastId).first().getOrNull()
                     if (details != null) {
@@ -476,8 +489,6 @@ class PodcastViewModel(
                         }
                     }
                 }
-            } else {
-                lastAutoplayContext = AutoplayContext.DOWNLOADS
             }
         }
     }
@@ -488,14 +499,19 @@ class PodcastViewModel(
             (episodeId to PlaybackPosition(episodeId, position, System.currentTimeMillis()))
     }
 
-    private fun persistSnapshot() {
-        val episode = _currentEpisode.value ?: return
+    // The player's own position when it holds this episode; ours can lag behind a queue advance.
+    private fun livePositionFor(episode: Episode): Long {
         val controller = mediaController
-        val position = if (controller != null && controller.currentMediaItem?.mediaId == episode.id) {
+        return if (controller != null && controller.currentMediaItem?.mediaId == episode.id) {
             controller.currentPosition
         } else {
             _currentPosition.longValue
         }
+    }
+
+    private fun persistSnapshot() {
+        val episode = _currentEpisode.value ?: return
+        val position = livePositionFor(episode)
         val speed = _playbackSpeed.value
         val context = lastAutoplayContext.name
         val artwork = _currentArtworkUri.value?.toString()
@@ -524,7 +540,7 @@ class PodcastViewModel(
                 val episodeId = mediaController?.currentMediaItem?.mediaId
                 val position = mediaController?.currentPosition ?: 0L
                 if (episodeId != null && position > 0) {
-                    _currentPosition.longValue = position
+                    if (episodeId == _currentEpisode.value?.id) _currentPosition.longValue = position
                     rememberPosition(episodeId, position)
                 }
             }
@@ -555,8 +571,8 @@ class PodcastViewModel(
                 if (endedId != null) {
                     // PlaybackService stores the full length; mirror it so the lists show it played.
                     val controllerDuration = mediaController?.duration ?: 0L
-                    val fullMs = if (controllerDuration > 0) controllerDuration
-                    else (DateTimeFormatter.parseDuration(_currentEpisode.value?.duration) ?: 0L) * 1000L
+                    val statedMs = (DateTimeFormatter.parseDuration(_currentEpisode.value?.duration) ?: 0L) * 1000L
+                    val fullMs = maxOf(controllerDuration, statedMs)
                     if (fullMs > 0) rememberPosition(endedId, fullMs)
                 }
                 // PlaybackService plays the next queued episode itself, so this works with
@@ -564,7 +580,9 @@ class PodcastViewModel(
                 if (endedId != null && PlaybackService.queueAdvancedFrom == endedId) return
             }
 
-            if (playbackState == Player.STATE_ENDED && settingsManager.isAutoPlayNextEpisodeEnabledSync()) {
+            if (playbackState == Player.STATE_ENDED && settingsManager.isAutoPlayNextEpisodeEnabledSync() &&
+                autoplayMayContinue()
+            ) {
                 var handled = false
                 when (lastAutoplayContext) {
                     AutoplayContext.PODCAST -> {
@@ -573,7 +591,7 @@ class PodcastViewModel(
                         val currentIndex = episodes?.indexOfFirst { it.id == currentId } ?: -1
                         val nextEpisode = if (currentIndex > 0) episodes?.get(currentIndex - 1) else null
                         if (nextEpisode != null) {
-                            playEpisode(nextEpisode, context = AutoplayContext.PODCAST)
+                            playEpisode(nextEpisode, context = AutoplayContext.PODCAST, fromAutoplay = true)
                             handled = true
                         }
                     }
@@ -591,7 +609,7 @@ class PodcastViewModel(
                         val currentIndex = downloadsOrdered.indexOfFirst { it.episode.id == currentId }
                         val nextDownload = if (currentIndex > 0) downloadsOrdered.getOrNull(currentIndex - 1) else null
                         if (nextDownload != null) {
-                            playEpisode(nextDownload.episode, context = AutoplayContext.DOWNLOADS)
+                            playEpisode(nextDownload.episode, context = AutoplayContext.DOWNLOADS, fromAutoplay = true)
                             handled = true
                         }
                     }
@@ -680,6 +698,23 @@ class PodcastViewModel(
         }
     }
 
+    // An autoplayed episode that ends at once was resumed at its end or won't play. Pass
+    // over one such episode, but stop at the second rather than race down the list.
+    private fun autoplayMayContinue(): Boolean {
+        val startedAt = autoplayStartedAtMs
+        val endedAtOnce = startedAt > 0 &&
+            android.os.SystemClock.elapsedRealtime() - startedAt < INSTANT_END_MS
+        instantAutoplayEnds = if (endedAtOnce) instantAutoplayEnds + 1 else 0
+        if (instantAutoplayEnds >= 2) {
+            com.calmcast.podcast.util.CrashLogger.log(
+                TAG, "Autoplay: halting after $instantAutoplayEnds episodes ended at once"
+            )
+            instantAutoplayEnds = 0
+            return false
+        }
+        return true
+    }
+
     private fun handleMediaItemChange(mediaItem: MediaItem?) {
         val controller = mediaController ?: return
         if (mediaItem == null) {
@@ -699,6 +734,15 @@ class PodcastViewModel(
             _chapters.value = emptyList()
             _currentChapterIndex.intValue = -1
             mediaItem.mediaMetadata.artworkUri?.let { _currentArtworkUri.value = it }
+            // Drop the last episode's place and length, or a re-prepare after an error
+            // would load this one at the old episode's end.
+            val onController = controller.currentMediaItem?.mediaId == mediaId
+            _currentPosition.longValue = if (onController) controller.currentPosition
+                else _playbackPositions.value[mediaId]?.position ?: 0L
+            val statedMs = DateTimeFormatter.parseDuration(
+                mediaItem.mediaMetadata.extras?.getString("duration")
+            )?.times(1000L) ?: 0L
+            _duration.longValue = if (onController && controller.duration > 0) controller.duration else statedMs
             loadListenHistory()
         }
 
@@ -1145,9 +1189,11 @@ class PodcastViewModel(
         restart: Boolean = false,
         context: AutoplayContext,
         autoPlay: Boolean = true,
-        showFullPlayer: Boolean = true
+        showFullPlayer: Boolean = true,
+        fromAutoplay: Boolean = false
     ) {
         lastAutoplayContext = context
+        if (!fromAutoplay) instantAutoplayEnds = 0
 
         // A user-initiated play supersedes any in-flight network recovery
         recoveryJob?.cancel()
@@ -1180,17 +1226,21 @@ class PodcastViewModel(
             var lastPosition = 0L
             if (!restart) {
                 lastPosition = repository.getPlaybackPosition(episode.id)?.position ?: 0L
-                // Already loaded: the live position is newer than the last periodic save.
+                var durationMs = (DateTimeFormatter.parseDuration(episode.duration) ?: 0L) * 1000L
+                // Already loaded: the live position is newer than the last periodic save,
+                // and the player's length is the real one.
                 val controller = mediaController
                 if (controller != null && controller.currentMediaItem?.mediaId == episode.id) {
                     lastPosition = controller.currentPosition
+                    if (controller.duration > 0) durationMs = controller.duration
                 }
-                val durationInSeconds = DateTimeFormatter.parseDuration(episode.duration)
-                if (durationInSeconds != null && lastPosition > 0) {
-                    val durationInMilliseconds = durationInSeconds * 1000
-                    if (lastPosition.toDouble() / durationInMilliseconds > 0.99) {
-                        lastPosition = 0L
-                    }
+                // Start over only if it was listened to the end; otherwise carry on from the saved
+                // place, even when the feed gives no length to judge by.
+                if (com.calmcast.podcast.data.FinishedEpisodes.has(application, episode.id)) {
+                    lastPosition = 0L
+                    com.calmcast.podcast.data.FinishedEpisodes.clear(application, episode.id)
+                } else if (durationMs > 0 && lastPosition.toDouble() / durationMs > 0.99) {
+                    lastPosition = 0L
                 }
             }
 
@@ -1220,6 +1270,7 @@ class PodcastViewModel(
                 .setMediaMetadata(mediaMetadata)
                 .build()
 
+            autoplayStartedAtMs = if (fromAutoplay) android.os.SystemClock.elapsedRealtime() else 0L
             mediaController?.setMediaItem(mediaItem, lastPosition)
             mediaController?.prepare()
             applyPlaybackSpeed(_playbackSpeed.value)
@@ -1251,10 +1302,11 @@ class PodcastViewModel(
             ) {
                 // Player died (network error or process restart). play() alone cannot leave
                 // STATE_IDLE — it must be re-prepared, or the button spins forever.
+                val resumeAt = livePositionFor(ep)
                 com.calmcast.podcast.util.CrashLogger.log(
-                    TAG, "togglePlayPause: player IDLE, re-preparing at ${_currentPosition.longValue}ms"
+                    TAG, "togglePlayPause: player IDLE, re-preparing at ${resumeAt}ms"
                 )
-                preparePlayerForRestoredItem(ep, _currentPosition.longValue)
+                preparePlayerForRestoredItem(ep, resumeAt)
             }
             mediaController?.play()
         }
@@ -1770,7 +1822,7 @@ class PodcastViewModel(
         }
         if (recoveryJob?.isActive == true) return
 
-        val resumePos = _currentPosition.longValue
+        val resumePos = livePositionFor(episode)
         // Only auto-resume if playback was actually in motion when the error hit
         // (not when a cold paused restore failed to pre-buffer).
         val shouldResume = mediaController?.playWhenReady ?: false

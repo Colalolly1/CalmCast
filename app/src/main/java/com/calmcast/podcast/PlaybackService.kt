@@ -361,8 +361,13 @@ class PlaybackService : MediaSessionService() {
 
     private fun onEpisodeEnded(player: ExoPlayer) {
         val endedId = player.currentMediaItem?.mediaId
-        // Store the full length so the episode reads as played.
-        savePosition(endedId, if (player.duration > 0) player.duration else player.currentPosition)
+        // Store the full length so the episode reads as played. The larger of the real and
+        // the feed's length, so a later play judges it finished and doesn't resume at the end.
+        val statedMs = DateTimeFormatter.parseDuration(
+            player.currentMediaItem?.mediaMetadata?.extras?.getString("duration")
+        )?.times(1000L) ?: 0L
+        savePosition(endedId, maxOf(player.duration, statedMs, player.currentPosition))
+        if (endedId != null) com.calmcast.podcast.data.FinishedEpisodes.mark(this, endedId)
 
         // The queue outranks implicit autoplay: queueing an episode is an explicit
         // "play this next" request, so advance regardless of the autoplay setting.
@@ -513,7 +518,8 @@ class PlaybackService : MediaSessionService() {
                 val leftMs = endsAt - SystemClock.elapsedRealtime()
                 if (leftMs <= 0) break
                 _sleepTimerRemainingSeconds.value = (leftMs + 999) / 1000
-                delay(leftMs.coerceAtMost(1000L))
+                // The player only shows whole minutes: wake as each one runs out, and at the exact end.
+                delay((leftMs - 1) % 60_000L + 1)
             }
             exoPlayer.pause()
             finishSleepTimer()
